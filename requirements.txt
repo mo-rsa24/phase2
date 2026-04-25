@@ -1,0 +1,28 @@
+# Core deep learning stack.
+# Install via scripts.sh so torch/torchvision come from the official PyTorch CUDA wheel index.
+torch==2.6.0
+torchvision==0.21.0
+
+# Numerical computing and evaluation.
+numpy==1.26.4
+scipy==1.15.2
+scikit-learn==1.6.1
+pandas==2.2.3
+
+# Configs, utilities, and data download.
+PyYAML==6.0.2
+tqdm==4.67.1
+requests==2.32.3
+einops==0.8.1
+
+# Visualization and image handling.
+matplotlib==3.10.1
+seaborn==0.13.2
+Pillow==11.1.0
+imageio==2.37.0
+
+# Logging and notebook workflow.
+tensorboard==2.19.0
+jupyterlab==4.4.1
+ipykernel==6.29.5
+ipywidgets==8.1.5
