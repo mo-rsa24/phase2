@@ -1,0 +1,25 @@
+# VAE training configuration for dSprites
+# Usage: python scripts/train_vae.py --config configs/vae.yaml
+
+model:
+  latent_dim: 10
+  img_size: [1, 64, 64]   # dSprites is grayscale 64x64
+
+training:
+  epochs: 50
+  batch_size: 128
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  beta: 1.0               # KL weight (1.0 = standard VAE; >1 = beta-VAE)
+  seed: 42
+
+data:
+  train_frac: 0.70
+  val_frac: 0.15
+  # test_frac: 0.15 (implicit)
+
+logging:
+  wandb_project: paper2-vae
+  log_interval: 5          # log recon grid + PCA manifold every N epochs
+  n_viz: 8                 # images per row in reconstruction grid
+  pca_samples: 5000        # val samples to encode for PCA manifold

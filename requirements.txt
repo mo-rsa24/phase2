@@ -21,6 +21,10 @@ seaborn==0.13.2
 Pillow==11.1.0
 imageio==2.37.0
 
+# Experiment tracking and web visualisation.
+wandb>=0.19.0
+flask>=3.0.0
+
 # Logging and notebook workflow.
 tensorboard==2.19.0
 jupyterlab==4.4.1
