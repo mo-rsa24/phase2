@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_NAME="${1:-phase2-repr}"
+DEFAULT_ENV="${CONDA_DEFAULT_ENV:-${MAMBA_DEFAULT_ENV:-phase2-repr}}"
+ENV_NAME="${1:-${DEFAULT_ENV}}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 TORCH_CHANNEL="${TORCH_CHANNEL:-}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

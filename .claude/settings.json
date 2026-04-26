@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /home/molef/PhD/Paper2/scripts/browse_dsprites.py)",
+      "Bash(chmod +x /home/molef/PhD/Paper2/scripts/launch_browser.sh /home/molef/PhD/Paper2/scripts/dsprites_browser_app.py)"
+    ]
+  }
+}
