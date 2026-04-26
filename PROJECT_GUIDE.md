@@ -387,6 +387,45 @@ logging:
 | 4 | 1.0 | Undercomplete bottleneck — forces compression |
 | 20 | 1.0 | Overcomplete — check for posterior collapse |
 
+These four cells are the **disentanglement sweep** — automated by `scripts/launch_sweep.sh` (Section 7.5).
+
+### 6.1 CLI Overrides
+
+`scripts/train_vae.py` accepts overrides that take precedence over the YAML. Useful for sweep cells, ad-hoc smoke tests, and per-node tuning without editing committed configs.
+
+| Flag | Overrides | Notes |
+|---|---|---|
+| `--latent-dim N` | `model.latent_dim` | Used by sweep cells 1–4. |
+| `--beta F` | `training.beta` | Floats accepted (e.g. `4.0`). |
+| `--seed N` | `training.seed` | For multi-seed bars later. |
+| `--epochs N` | `training.epochs` | Smoke-test in 1–2 epochs. |
+| `--batch-size N` | `training.batch_size` | Otherwise from runtime overlay. |
+| `--num-workers N` | (DataLoader) | Otherwise from runtime overlay. |
+| `--runtime KEY` | applies overlay | `hippo` or `cluster48`. |
+| `--no-compile` | disables `torch.compile` | Escape hatch if compile breaks. |
+| `--wandb-group STR` | — | Logged on `wandb.init`. |
+| `--wandb-tags T1 T2 ...` | — | Filterable tags. |
+| `--wandb-notes STR` | — | Free-text notes on the run. |
+| `--purpose STR` | — | Logged to `wandb.config` for filtering. |
+| `--experiment-id N` | — | Logged to `wandb.config`. |
+| `--node STR` | — | Logical node label for the run. |
+
+### 6.2 Runtime Overlays
+
+The `runtime:` section of `configs/vae.yaml` provides per-node defaults that fill `batch_size` and `num_workers` when `--runtime KEY` is passed:
+
+```yaml
+runtime:
+  hippo:                   # 1x RTX 5090 (32 GB)
+    batch_size: 1024
+    num_workers: 6
+  cluster48:               # mscluster106 / mscluster107 (2x 48 GB cards)
+    batch_size: 2048
+    num_workers: 8
+```
+
+CLI flags still win over the overlay. The launcher (Section 7.5) sets `--runtime` automatically based on `--node`.
+
 ---
 
 ## 7. Training Guide & wandb
@@ -394,13 +433,20 @@ logging:
 ### 7.1 Prerequisites
 
 ```bash
-# Install dependencies (use the phase2 conda env)
-micromamba activate phase2
+# Install dependencies (use the phase2-repr micromamba env; see scripts.sh)
+micromamba activate phase2-repr
 
-# wandb login (one-time)
+# wandb login (one-time per machine)
 wandb login
 # → paste your API key from https://wandb.ai/authorize
 ```
+
+> **Blackwell GPUs (RTX 5090 / B-series):** the pinned `torch==2.6.0+cu124` in `requirements.txt` does not ship `sm_120` kernels and will fail at first CUDA call with *"no kernel image is available"*. After running `scripts.sh`, upgrade with:
+> ```bash
+> micromamba run -n phase2-repr pip install --upgrade \
+>     --index-url https://download.pytorch.org/whl/cu128 torch torchvision
+> ```
+> The training script's device-capability probe (`probe_device()` in `scripts/train_vae.py`) aborts cleanly with a fix message if it detects a wheel/SM mismatch.
 
 ### 7.2 Starting a Training Run
 
@@ -450,6 +496,92 @@ Navigate to `https://wandb.ai/` → your project `paper2-vae`. You will see:
 3. The **Summary** panel on the right shows the best validation loss so far
 
 You can inspect any logged step by scrubbing the epoch slider in the Media panel.
+
+### 7.5 Multi-Node Disentanglement Sweep
+
+The four-cell sweep from Section 6 is automated end-to-end by `scripts/launch_sweep.sh`. It dispatches experiments across the available GPUs, applies the right runtime overlay, and tags every run for clean W&B comparison.
+
+#### Compute mapping
+
+| `--node` | Runtime overlay | GPU 0 | GPU 1 | Mode |
+|---|---|---|---|---|
+| `hippo` | `hippo` | exp 1 → 2 → 3 → 4 | — | sequential |
+| `mscluster106` | `cluster48` | exp 1 (baseline) | exp 2 (β-VAE) | parallel |
+| `mscluster107` | `cluster48` | exp 3 (undercomplete) | exp 4 (overcomplete) | parallel |
+
+Each parallel cluster run gets its own process and its own `CUDA_VISIBLE_DEVICES`, so the two GPUs on a node train fully independently.
+
+#### Running the full sweep
+
+```bash
+# On hippo — 4 experiments sequentially on GPU 0 (≈4 × full training time)
+bash scripts/launch_sweep.sh --node hippo
+
+# On mscluster106 — exp 1 + exp 2 in parallel on GPU 0 / GPU 1
+bash scripts/launch_sweep.sh --node mscluster106
+
+# On mscluster107 — exp 3 + exp 4 in parallel on GPU 0 / GPU 1
+bash scripts/launch_sweep.sh --node mscluster107
+```
+
+The cluster runs are independent — open two SSH sessions (one per node) and start both. All four runs land in the same W&B group so you can compare them in one dashboard.
+
+#### Smoke test (do this first)
+
+```bash
+# Print the four commands without running them — sanity check the dispatch
+bash scripts/launch_sweep.sh --node hippo --dry-run
+
+# Run all 4 cells for 1 epoch each (~5 min on the 5090) — confirms the
+# whole pipeline works and the runs land in W&B with the right metadata
+bash scripts/launch_sweep.sh --node hippo --epochs 1
+```
+
+If `torch.compile` causes issues on a node, add `--no-compile`. The `--seed N` flag is forwarded into the run name for multi-seed bars later.
+
+#### What you get on W&B
+
+Every sweep run lands in **project `paper2-vae`** with the following metadata:
+
+| Field | Value |
+|---|---|
+| **group** | `disentanglement-sweep-2026-04-26` |
+| **name** | `vae_z{latent_dim}_beta{beta}_seed{seed}` |
+| **tags** | `vae`, `sweep:disentanglement-sweep`, `z{ld}`, `beta{b}`, `{purpose}`, `runtime:{hippo\|cluster48}`, `node:{hostname}` |
+| **notes** | Purpose column from the table (e.g. *"Beta-VAE, push toward disentanglement"*) |
+| **config extras** | `experiment_id`, `purpose`, `gpu_name`, `gpu_sm`, `host`, `cuda_visible_devices` |
+
+Quick filters in the W&B UI:
+
+- `group:disentanglement-sweep-2026-04-26` — the whole sweep, side by side.
+- `tag:beta4` — only the β-VAE runs (across nodes/seeds).
+- `tag:overcomplete` — only the posterior-collapse cell.
+- `tag:node:mscluster106` — what landed on a particular node.
+
+#### Logs and checkpoints
+
+Per-run console output is teed to `logs/sweep/{run_name}.log` so you can `tail -f` while training. Checkpoints land under `checkpoints/vae/{run_name}/{best,final}.pt` and are also uploaded as a W&B Artifact named `vae-checkpoint`.
+
+```bash
+# In another terminal:
+tail -f logs/sweep/vae_z10_beta1.0_seed42.log
+nvidia-smi -l 1
+```
+
+### 7.6 GPU Sanity Check
+
+`scripts/sanity_check_vae.py` is a standalone, no-W&B script for verifying the install and warming the GPU. It runs the model end-to-end (encode → decode → full forward), prints every tensor shape, then runs a short bf16 stress loop with `torch.compile`, fused Adam, TF32, and a large batch to confirm the card actually lights up.
+
+```bash
+micromamba run -n phase2-repr python scripts/sanity_check_vae.py
+```
+
+Use this when:
+- Setting up a new node (catches the wheel / SM mismatch immediately).
+- Diagnosing whether perf knobs (`torch.compile`, autocast) work on the node before kicking off real training.
+- Verifying the GPU is reachable from inside the env (`CUDA_VISIBLE_DEVICES` plumbing is correct).
+
+It reports peak VRAM and throughput, so you can compare nodes objectively.
 
 ---
 
@@ -543,14 +675,34 @@ Once you have a trained checkpoint, the reconstruction browser lets you explore 
 
 ### 9.1 Launching
 
+For a single training run (default `--out-dir checkpoints/vae`):
+
 ```bash
-python scripts/vae_reconstruction_app.py \
+micromamba run -n phase2-repr python scripts/vae_reconstruction_app.py \
     --checkpoint checkpoints/vae/best.pt \
     --latent-dim 10 \
     --port 5001
 ```
 
-Then open `http://localhost:5001` in your browser.
+For sweep runs (each cell saves to `checkpoints/vae/{run_name}/`):
+
+```bash
+# Inspect the β-VAE cell
+micromamba run -n phase2-repr python scripts/vae_reconstruction_app.py \
+    --checkpoint checkpoints/vae/vae_z10_beta4.0_seed42/best.pt \
+    --latent-dim 10 \
+    --port 5001
+
+# Inspect the undercomplete cell (note --latent-dim must match the run)
+micromamba run -n phase2-repr python scripts/vae_reconstruction_app.py \
+    --checkpoint checkpoints/vae/vae_z4_beta1.0_seed42/best.pt \
+    --latent-dim 4 \
+    --port 5002
+```
+
+Then open `http://localhost:5001` (or `5002`) in your browser.
+
+> **Tip:** `--latent-dim` is auto-inferred from the checkpoint's encoder weights by `load_encoder_decoder()`, so in most cases you can omit it. Pass it explicitly only when the loader can't disambiguate.
 
 ### 9.2 Interface
 

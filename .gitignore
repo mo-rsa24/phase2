@@ -8,4 +8,7 @@ data/
 outputs/
 *.pt
 *.pth
+*.png
 *.ckpt
+*.log
+wandb/

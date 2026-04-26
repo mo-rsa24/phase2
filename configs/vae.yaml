@@ -23,3 +23,13 @@ logging:
   log_interval: 5          # log recon grid + PCA manifold every N epochs
   n_viz: 8                 # images per row in reconstruction grid
   pca_samples: 5000        # val samples to encode for PCA manifold
+
+# Selected by `train_vae.py --runtime <key>`. Overrides batch_size and num_workers.
+# CLI flags still win over these.
+runtime:
+  hippo:                   # 1x RTX 5090 (32 GB)
+    batch_size: 1024
+    num_workers: 6
+  cluster48:               # mscluster106 / mscluster107 (2x 48 GB cards)
+    batch_size: 2048
+    num_workers: 8

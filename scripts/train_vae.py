@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import io
+import socket
 from pathlib import Path
 
 import matplotlib
@@ -34,8 +35,69 @@ def parse_args():
     p.add_argument("--config",          type=str, default="configs/vae.yaml")
     p.add_argument("--data-dir",        type=str, default="data")
     p.add_argument("--out-dir",         type=str, default="checkpoints/vae")
+    # Experiment overrides (CLI > YAML).
+    p.add_argument("--latent-dim",      type=int,   default=None)
+    p.add_argument("--beta",            type=float, default=None)
+    p.add_argument("--seed",            type=int,   default=None)
+    p.add_argument("--epochs",          type=int,   default=None)
+    p.add_argument("--batch-size",      type=int,   default=None)
+    p.add_argument("--num-workers",     type=int,   default=None)
+    # Runtime overlay key in configs/vae.yaml -> runtime.{key}.
+    p.add_argument("--runtime",         type=str,   default=None,
+                   help="Runtime overlay key (e.g. 'hippo', 'cluster48').")
+    # W&B metadata.
     p.add_argument("--wandb-run-name",  type=str, default=None)
+    p.add_argument("--wandb-group",     type=str, default=None)
+    p.add_argument("--wandb-tags",      type=str, nargs="*", default=None)
+    p.add_argument("--wandb-notes",     type=str, default=None)
+    p.add_argument("--purpose",         type=str, default=None)
+    p.add_argument("--experiment-id",   type=int, default=None)
+    p.add_argument("--node",            type=str, default=None,
+                   help="Node label logged with the run (hippo, mscluster106, ...).")
+    # Perf escape hatch.
+    p.add_argument("--no-compile",      action="store_true",
+                   help="Disable torch.compile (use if compilation breaks on a node).")
     return p.parse_args()
+
+
+def probe_device() -> dict:
+    """Print device info; abort if installed torch wheel can't run on the GPU."""
+    info = {
+        "host":                  socket.gethostname(),
+        "torch":                 torch.__version__,
+        "cuda_visible_devices":  os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    }
+    if not torch.cuda.is_available():
+        info["device"] = "cpu"
+        print(f"[device] cpu  host={info['host']}  torch={info['torch']}")
+        return info
+
+    props = torch.cuda.get_device_properties(0)
+    sm = f"sm_{props.major}{props.minor}"
+    arch_list = torch.cuda.get_arch_list()
+    info.update({
+        "device":     "cuda",
+        "gpu_name":   props.name,
+        "gpu_sm":     sm,
+        "vram_gb":    round(props.total_memory / 1e9, 1),
+        "arch_list":  arch_list,
+    })
+    print(f"[device] cuda  gpu={props.name}  sm={sm}  vram={info['vram_gb']}GB  "
+          f"torch={info['torch']}  CUDA_VISIBLE_DEVICES={info['cuda_visible_devices']}")
+    print(f"[device] torch arch_list={arch_list}")
+
+    if sm not in arch_list:
+        # Don't abort if PTX JIT might cover us (sm_80 PTX runs on >=sm_80) — but the
+        # symptom we hit on the 5090 was a hard "no kernel image is available" error,
+        # which only appears at first kernel launch. Fail fast with an actionable msg.
+        sys.stderr.write(
+            f"\nFATAL: installed torch supports {arch_list} but this GPU is {sm}.\n"
+            f"  GPU:  {props.name}\n"
+            f"  Fix:  reinstall torch with a CUDA wheel that ships {sm} kernels.\n"
+            f"        e.g. pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision\n"
+        )
+        sys.exit(1)
+    return info
 
 
 def load_config(path: str) -> dict:
@@ -140,16 +202,23 @@ def make_pca_manifold(
 # Training / validation
 # ---------------------------------------------------------------------------
 
-def train_epoch(vae, device, loader, optimizer, criterion, beta):
+def _autocast_ctx(device: torch.device, enabled: bool):
+    if enabled and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return torch.autocast(device_type="cpu", enabled=False)
+
+
+def train_epoch(vae, device, loader, optimizer, criterion, beta, *, amp: bool):
     vae.train()
     total_recon = total_kl = 0.0
     for x, _ in loader:
-        x = x.to(device)
-        x_hat, _, _ = vae(x)
-        recon_loss = criterion(x_hat, x)
-        kl_loss    = vae.encoder.kl / x.shape[0]
-        loss       = recon_loss + beta * kl_loss
-        optimizer.zero_grad()
+        x = x.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with _autocast_ctx(device, amp):
+            x_hat, _, _ = vae(x)
+            recon_loss = criterion(x_hat, x)
+            kl_loss    = vae.encoder.kl / x.shape[0]
+            loss       = recon_loss + beta * kl_loss
         loss.backward()
         optimizer.step()
         total_recon += recon_loss.item()
@@ -158,15 +227,18 @@ def train_epoch(vae, device, loader, optimizer, criterion, beta):
     return total_recon / n, total_kl / n
 
 
-def val_epoch(vae, device, loader, criterion, beta):
+def val_epoch(vae, device, loader, criterion, beta, *, amp: bool):
     vae.eval()
     total_recon = total_kl = 0.0
     with torch.no_grad():
         for x, _ in loader:
-            x = x.to(device)
-            x_hat, _, _ = vae(x)
-            total_recon += criterion(x_hat, x).item()
-            total_kl    += (vae.encoder.kl / x.shape[0]).item()
+            x = x.to(device, non_blocking=True)
+            with _autocast_ctx(device, amp):
+                x_hat, _, _ = vae(x)
+                recon = criterion(x_hat, x)
+                kl    = vae.encoder.kl / x.shape[0]
+            total_recon += recon.item()
+            total_kl    += kl.item()
     n = len(loader)
     return total_recon / n, total_kl / n
 
@@ -183,9 +255,28 @@ def main():
     t_cfg   = cfg["training"]
     d_cfg   = cfg["data"]
     log_cfg = cfg["logging"]
+    rt_cfg  = (cfg.get("runtime") or {}).get(args.runtime, {}) if args.runtime else {}
+
+    # --- Apply CLI overrides (CLI > runtime overlay > YAML defaults) ---
+    if args.latent_dim  is not None: m_cfg["latent_dim"]  = args.latent_dim
+    if args.beta        is not None: t_cfg["beta"]        = args.beta
+    if args.seed        is not None: t_cfg["seed"]        = args.seed
+    if args.epochs      is not None: t_cfg["epochs"]      = args.epochs
+    if args.batch_size  is not None: t_cfg["batch_size"]  = args.batch_size
+    elif "batch_size"  in rt_cfg:   t_cfg["batch_size"]  = rt_cfg["batch_size"]
+    num_workers = args.num_workers if args.num_workers is not None else rt_cfg.get("num_workers", 4)
+
+    # --- Device probe and perf knobs ---
+    dev_info = probe_device()
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.set_float32_matmul_precision("high")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    amp_enabled = device.type == "cuda"
 
     seed_everything(t_cfg["seed"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Data ---
     dataset = load_dsprites(args.data_dir)
@@ -197,22 +288,34 @@ def main():
     )
     train_ds = DSpritesDataset(dataset, train_idx)
     val_ds   = DSpritesDataset(dataset, val_idx)
-    train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=t_cfg["batch_size"], shuffle=True,
-        num_workers=4, pin_memory=True,
+    loader_kwargs = dict(
+        batch_size=t_cfg["batch_size"],
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
     )
-    val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=t_cfg["batch_size"], shuffle=False,
-        num_workers=4, pin_memory=True,
-    )
+    train_loader = torch.utils.data.DataLoader(train_ds, shuffle=True,  **loader_kwargs)
+    val_loader   = torch.utils.data.DataLoader(val_ds,   shuffle=False, **loader_kwargs)
 
     # --- Model ---
     img_size = torch.Size(m_cfg["img_size"])
     vae = VAE(latent_dim=m_cfg["latent_dim"], img_size=img_size).to(device)
     optimizer = torch.optim.Adam(
-        vae.parameters(), lr=t_cfg["lr"], weight_decay=t_cfg["weight_decay"]
+        vae.parameters(),
+        lr=t_cfg["lr"],
+        weight_decay=t_cfg["weight_decay"],
+        fused=(device.type == "cuda"),
     )
     criterion = nn.MSELoss()
+
+    if not args.no_compile and device.type == "cuda":
+        try:
+            vae = torch.compile(vae)
+            print("[perf] torch.compile enabled")
+        except Exception as e:
+            print(f"[perf] torch.compile skipped: {e}")
+    else:
+        print("[perf] torch.compile disabled")
 
     # --- wandb ---
     flat_cfg = {
@@ -226,10 +329,25 @@ def main():
         "seed":         t_cfg["seed"],
         "train_frac":   d_cfg["train_frac"],
         "val_frac":     d_cfg["val_frac"],
+        "num_workers":  num_workers,
+        "amp_dtype":    "bfloat16" if amp_enabled else "fp32",
+        "experiment_id": args.experiment_id,
+        "purpose":       args.purpose,
+        "sweep_name":    args.wandb_group,
+        "node":          args.node,
+        "runtime":       args.runtime,
+        "host":          dev_info.get("host"),
+        "gpu_name":      dev_info.get("gpu_name"),
+        "gpu_sm":        dev_info.get("gpu_sm"),
+        "vram_gb":       dev_info.get("vram_gb"),
+        "cuda_visible_devices": dev_info.get("cuda_visible_devices"),
     }
     run = wandb.init(
         project=log_cfg["wandb_project"],
         name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=args.wandb_tags,
+        notes=args.wandb_notes,
         config=flat_cfg,
     )
 
@@ -243,9 +361,11 @@ def main():
 
     for epoch in tqdm(range(1, t_cfg["epochs"] + 1), desc="Epochs"):
         train_recon, train_kl = train_epoch(
-            vae, device, train_loader, optimizer, criterion, beta
+            vae, device, train_loader, optimizer, criterion, beta, amp=amp_enabled
         )
-        val_recon, val_kl = val_epoch(vae, device, val_loader, criterion, beta)
+        val_recon, val_kl = val_epoch(
+            vae, device, val_loader, criterion, beta, amp=amp_enabled
+        )
         val_loss = val_recon + beta * val_kl
 
         log = {
