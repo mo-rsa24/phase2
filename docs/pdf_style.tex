@@ -1,0 +1,68 @@
+%% Custom style header — loaded via pandoc --include-in-header
+%% NOTE: hyperref, xcolor, fontspec, booktabs, fancyvrb are already loaded
+%%       by pandoc's default xelatex template; do not reload them here.
+
+%% ── Typography ──────────────────────────────────────────────────────────────
+\usepackage{microtype}
+\setlength{\parskip}{7pt}
+\setlength{\parindent}{0pt}
+
+%% ── Color palette ───────────────────────────────────────────────────────────
+\definecolor{headblue}  {HTML}{1A237E}
+\definecolor{subblue}   {HTML}{283593}
+\definecolor{codebg}    {HTML}{F6F8FA}
+\definecolor{codeborder}{HTML}{D0D7DE}
+\definecolor{tableheadbg}{HTML}{E8EAF6}
+
+%% ── Section headings ────────────────────────────────────────────────────────
+\usepackage{titlesec}
+
+\titleformat{\section}
+  {\Large\bfseries\color{headblue}}
+  {}
+  {0em}
+  {}
+  [\vspace{1pt}\color{headblue}\titlerule\vspace{2pt}]
+
+\titleformat{\subsection}
+  {\large\bfseries\color{subblue}}
+  {}
+  {0em}
+  {}
+
+\titleformat{\subsubsection}
+  {\normalsize\bfseries\color{subblue}}
+  {}
+  {0em}
+  {}
+
+\titlespacing{\section}      {0pt}{18pt}{6pt}
+\titlespacing{\subsection}   {0pt}{14pt}{4pt}
+\titlespacing{\subsubsection}{0pt}{10pt}{3pt}
+
+%% ── Code block shading ──────────────────────────────────────────────────────
+%% pandoc defines Shaded (using framed's snugshade) in the document body
+%% after headers are included; we patch it at \begin{document}.
+\usepackage{mdframed}
+
+\AtBeginDocument{%
+  \renewenvironment{Shaded}{%
+    \begin{mdframed}[%
+      backgroundcolor  = codebg,%
+      linecolor        = codeborder,%
+      linewidth        = 0.6pt,%
+      roundcorner      = 3pt,%
+      innerleftmargin  = 10pt,%
+      innerrightmargin = 10pt,%
+      innertopmargin   = 6pt,%
+      innerbottommargin= 6pt,%
+      skipabove        = 5pt,%
+      skipbelow        = 5pt,%
+    ]%
+  }{%
+    \end{mdframed}%
+  }%
+}
+
+%% ── Tables ──────────────────────────────────────────────────────────────────
+\renewcommand{\arraystretch}{1.35}
