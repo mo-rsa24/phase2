@@ -315,7 +315,7 @@ def main():
     # Bernoulli negative log-likelihood per sample. A global mean MSE makes the
     # reconstruction term about 4096x smaller than the KL term on 64x64 images.
     def criterion(x_hat, x):
-        return F.binary_cross_entropy(x_hat, x, reduction="sum") / x.shape[0]
+        return F.binary_cross_entropy(x_hat.float(), x.float(), reduction="sum") / x.shape[0]
 
     if not args.no_compile and device.type == "cuda":
         try:
