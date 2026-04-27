@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VAE Disentanglement Explorer</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+  body { background:#f1f5f9; font-size:14px; }
+  .navbar-brand { letter-spacing:.03em; font-size:1rem; }
+  /* images */
+  .img-box { background:#111; border-radius:6px; display:flex;
+             align-items:center; justify-content:center; overflow:hidden;
+             aspect-ratio:1; width:100%; }
+  .img-box img { width:100%; height:100%; object-fit:contain; image-rendering:pixelated; }
+  .img-placeholder { color:#555; font-size:11px; text-align:center; padding:12px; }
+  /* cards */
+  .panel { background:#fff; border-radius:8px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  /* run cards */
+  .exp-card { cursor:pointer; border:2px solid #e5e7eb !important; transition:border-color .15s; }
+  .exp-card:hover { border-color:#2563eb !important; }
+  .exp-card.loaded { border-color:#16a34a !important; background:#f0fdf4; }
+  /* sliders */
+  .slider-row { display:flex; align-items:center; gap:8px; margin:5px 0; }
+  .slider-lbl { font-family:monospace; font-size:12px; min-width:110px; color:#374151; }
+  .slider-val { font-family:monospace; font-size:12px; min-width:44px; text-align:right; color:#2563eb; }
+  .kl-badge   { font-size:10px; color:#9ca3af; }
+  input[type=range] { flex:1; accent-color:#2563eb; }
+  /* status */
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; }
+  .dot-green { background:#16a34a; }
+  .dot-red   { background:#dc2626; }
+  .dot-spin  { background:#f59e0b; animation:pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  /* tabs */
+  .nav-tabs .nav-link { color:#6b7280; }
+  .nav-tabs .nav-link.active { color:#1d4ed8; font-weight:600; }
+  /* metric pill */
+  .mig-score { font-size:2.5rem; font-weight:700; color:#1d4ed8; }
+  .mig-bar   { height:18px; border-radius:4px; background:#dbeafe; margin:3px 0; }
+  .mig-fill  { height:100%; border-radius:4px; background:#2563eb; }
+  /* grid image */
+  #grid-img  { max-width:100%; border-radius:6px; image-rendering:pixelated; }
+  /* misc */
+  .small-mono { font-family:monospace; font-size:11px; }
+  .latent-sliders-wrap { max-height:380px; overflow-y:auto; padding-right:4px; }
+</style>
+</head>
+<body>
+
+<!-- ── Navbar ──────────────────────────────────────────────────────────────── -->
+<nav class="navbar navbar-dark bg-dark px-4 py-2">
+  <span class="navbar-brand fw-semibold">VAE Disentanglement Explorer</span>
+  <span class="navbar-text small" id="nav-status">
+    <span class="dot dot-red me-1" id="status-dot"></span>
+    <span id="status-text">No model loaded</span>
+  </span>
+</nav>
+
+<div class="container-fluid py-3 px-4">
+
+<!-- ── Tabs ───────────────────────────────────────────────────────────────── -->
+<ul class="nav nav-tabs mb-3" id="mainTabs" role="tablist">
+  <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-run">Select Run</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-explore">Explore</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-grid">Traversal Grid</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-analysis">Analysis</button></li>
+</ul>
+
+<div class="tab-content">
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     TAB 1: SELECT RUN
+═══════════════════════════════════════════════════════════════════════════ -->
+<div class="tab-pane fade show active" id="tab-run">
+  <div class="row g-3">
+
+    <!-- Experiment presets -->
+    <div class="col-lg-8">
+      <div class="panel h-100">
+        <h6 class="fw-semibold mb-3">Sweep Experiments</h6>
+        <div class="row g-2" id="exp-cards">
+          {% for exp in experiments %}
+          <div class="col-md-6">
+            <div class="card exp-card p-3" id="exp-card-{{ exp.id }}"
+                 onclick="loadPreset('{{ exp.checkpoint }}', {{ exp.id }})">
+              <div class="d-flex justify-content-between align-items-start">
+                <div>
+                  <div class="fw-semibold">{{ exp.label }}</div>
+                  <div class="text-muted small">{{ exp.purpose }}</div>
+                </div>
+                <span class="badge bg-secondary small-mono">seed={{ exp.seed }}</span>
+              </div>
+              <div class="mt-2 small-mono text-muted">{{ exp.checkpoint }}</div>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <!-- Custom path -->
+    <div class="col-lg-4">
+      <div class="panel">
+        <h6 class="fw-semibold mb-3">Custom Checkpoint</h6>
+        <div class="mb-2">
+          <label class="form-label small text-muted">Local .pt file path</label>
+          <input type="text" class="form-control form-control-sm font-monospace"
+                 id="custom-ckpt" placeholder="checkpoints/vae/.../best.pt">
+        </div>
+        <button class="btn btn-primary btn-sm w-100" onclick="loadCustom()">Load</button>
+
+        <hr class="my-3">
+        <div id="load-info" class="small text-muted">
+          {% if loaded_ckpt %}
+          <div class="text-success">&#10003; Loaded: <span class="font-monospace">{{ loaded_ckpt }}</span></div>
+          <div>latent_dim = {{ loaded_latent_dim }}</div>
+          {% else %}
+          Select a preset or enter a path above.
+          {% endif %}
+        </div>
+        <div id="load-error" class="small text-danger mt-1"></div>
+      </div>
+
+      <div class="panel mt-3">
+        <h6 class="fw-semibold mb-1">What each experiment tests</h6>
+        <ul class="small text-muted mb-0 ps-3">
+          <li><strong>Exp 1</strong> — Baseline VAE (β=1). Are factors at all separated?</li>
+          <li><strong>Exp 2</strong> — β-VAE (β=4). Does stronger KL pressure improve disentanglement?</li>
+          <li><strong>Exp 3</strong> — Undercomplete (z=4). 4 dims for 5 factors — forced bottleneck.</li>
+          <li><strong>Exp 4</strong> — Overcomplete (z=20). Posterior collapse risk, redundancy.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div><!-- /tab-run -->
+
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     TAB 2: EXPLORE
+     Left:  dSprites factor sliders → encode
+     Middle: original / reconstruction / diff
+     Right: latent sliders → traversal
+═══════════════════════════════════════════════════════════════════════════ -->
+<div class="tab-pane fade" id="tab-explore">
+  <div class="row g-3">
+
+    <!-- ── Factor sliders ── -->
+    <div class="col-lg-3">
+      <div class="panel">
+        <h6 class="fw-semibold mb-3">dSprites Factor Space</h6>
+        <div class="text-muted small mb-3">
+          Move sliders to navigate to any dSprites image. Updates live.
+        </div>
+
+        <!-- shape -->
+        <div class="slider-row">
+          <span class="slider-lbl">shape</span>
+          <input type="range" id="f-shape" min="0" max="2" step="1" value="0" oninput="onFactorChange()">
+          <span class="slider-val" id="v-shape">0 (square)</span>
+        </div>
+        <!-- scale -->
+        <div class="slider-row">
+          <span class="slider-lbl">scale</span>
+          <input type="range" id="f-scale" min="0" max="5" step="1" value="2" oninput="onFactorChange()">
+          <span class="slider-val" id="v-scale">2</span>
+        </div>
+        <!-- orientation -->
+        <div class="slider-row">
+          <span class="slider-lbl">orientation</span>
+          <input type="range" id="f-orientation" min="0" max="39" step="1" value="0" oninput="onFactorChange()">
+          <span class="slider-val" id="v-orientation">0° (0)</span>
+        </div>
+        <!-- pos_x -->
+        <div class="slider-row">
+          <span class="slider-lbl">pos_x</span>
+          <input type="range" id="f-pos_x" min="0" max="31" step="1" value="15" oninput="onFactorChange()">
+          <span class="slider-val" id="v-pos_x">15</span>
+        </div>
+        <!-- pos_y -->
+        <div class="slider-row">
+          <span class="slider-lbl">pos_y</span>
+          <input type="range" id="f-pos_y" min="0" max="31" step="1" value="15" oninput="onFactorChange()">
+          <span class="slider-val" id="v-pos_y">15</span>
+        </div>
+
+        <button class="btn btn-outline-primary btn-sm w-100 mt-3"
+                onclick="setAsAnchor()" id="btn-anchor" disabled>
+          Use as Anchor →
+        </button>
+        <div class="small text-muted mt-1" id="anchor-hint">
+          Encode an image first, then use it as the starting point for latent traversal.
+        </div>
+      </div>
+
+      <!-- Latent μ bars -->
+      <div class="panel mt-3">
+        <h6 class="fw-semibold mb-2">Posterior μ  <span class="kl-badge">(current encoding)</span></h6>
+        <div id="mu-bars" class="small-mono text-muted">—</div>
+      </div>
+    </div>
+
+    <!-- ── Image panels ── -->
+    <div class="col-lg-5">
+      <div class="panel">
+        <div class="row g-2">
+          <div class="col-4">
+            <div class="text-center small fw-semibold mb-1">Original</div>
+            <div class="img-box" id="orig-box">
+              <div class="img-placeholder">No image</div>
+            </div>
+          </div>
+          <div class="col-4">
+            <div class="text-center small fw-semibold mb-1">Reconstruction</div>
+            <div class="img-box" id="recon-box">
+              <div class="img-placeholder">—</div>
+            </div>
+          </div>
+          <div class="col-4">
+            <div class="text-center small fw-semibold mb-1">|Difference|</div>
+            <div class="img-box" id="diff-box">
+              <div class="img-placeholder">—</div>
+            </div>
+          </div>
+        </div>
+        <div class="mt-2 small text-muted" id="encode-meta">MSE: —</div>
+      </div>
+
+      <!-- Anchor traversal reconstruction -->
+      <div class="panel mt-3" id="traversal-panel" style="display:none">
+        <h6 class="fw-semibold mb-2">Latent Traversal Reconstruction
+          <span class="kl-badge">(from anchor)</span></h6>
+        <div class="row g-2">
+          <div class="col-6">
+            <div class="text-center small mb-1">Anchor</div>
+            <div class="img-box" id="anchor-box">
+              <div class="img-placeholder">—</div>
+            </div>
+          </div>
+          <div class="col-6">
+            <div class="text-center small mb-1">Traversal</div>
+            <div class="img-box" id="trav-box">
+              <div class="img-placeholder">—</div>
+            </div>
+          </div>
+        </div>
+        <div class="mt-2 small text-muted" id="trav-meta"></div>
+        <button class="btn btn-outline-secondary btn-sm mt-2" onclick="resetToAnchor()">
+          Reset to Anchor
+        </button>
+      </div>
+    </div>
+
+    <!-- ── Latent sliders ── -->
+    <div class="col-lg-4">
+      <div class="panel h-100">
+        <h6 class="fw-semibold mb-1">Latent Dimensions
+          <span class="kl-badge">(sorted by mean KL)</span></h6>
+        <div class="text-muted small mb-3">
+          Drag to traverse individual dims while holding others fixed.
+          Set an anchor first to initialise from a real encoding.
+        </div>
+        <div class="latent-sliders-wrap" id="latent-sliders">
+          <div class="text-muted small">Load a model to see latent sliders.</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div><!-- /tab-explore -->
+
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     TAB 3: TRAVERSAL GRID
+═══════════════════════════════════════════════════════════════════════════ -->
+<div class="tab-pane fade" id="tab-grid">
+  <div class="row g-3">
+
+    <div class="col-lg-3">
+      <div class="panel">
+        <h6 class="fw-semibold mb-3">Grid Settings</h6>
+
+        <label class="form-label small text-muted">Steps per dimension</label>
+        <div class="slider-row mb-2">
+          <input type="range" id="g-steps" min="5" max="15" step="2" value="11"
+                 oninput="document.getElementById('v-steps').textContent=this.value">
+          <span class="slider-val" id="v-steps">11</span>
+        </div>
+
+        <label class="form-label small text-muted">Range (σ units)</label>
+        <div class="slider-row mb-2">
+          <input type="range" id="g-range" min="1" max="5" step="0.5" value="3"
+                 oninput="document.getElementById('v-range').textContent=this.value+'σ'">
+          <span class="slider-val" id="v-range">3σ</span>
+        </div>
+
+        <label class="form-label small text-muted">Max dims to show</label>
+        <div class="slider-row mb-2">
+          <input type="range" id="g-maxdims" min="2" max="20" step="1" value="10"
+                 oninput="document.getElementById('v-maxdims').textContent=this.value">
+          <span class="slider-val" id="v-maxdims">10</span>
+        </div>
+
+        <div class="form-check form-switch mb-3">
+          <input class="form-check-input" type="checkbox" id="g-anchor-sigma">
+          <label class="form-check-label small" for="g-anchor-sigma">
+            Use anchor's σ (else σ=1)
+          </label>
+        </div>
+
+        <button class="btn btn-primary btn-sm w-100" onclick="generateGrid()" id="btn-grid">
+          Generate Grid
+        </button>
+        <div class="small text-muted mt-2">
+          Requires an anchor set in the Explore tab.
+          Dims sorted by mean KL (most active first).
+        </div>
+        <div id="grid-error" class="small text-danger mt-1"></div>
+      </div>
+    </div>
+
+    <div class="col-lg-9">
+      <div class="panel text-center">
+        <div id="grid-spinner" style="display:none" class="py-4 text-muted">
+          <div class="spinner-border spinner-border-sm me-2"></div> Generating …
+        </div>
+        <img id="grid-img" src="" alt="Traversal grid" style="display:none; max-width:100%">
+        <div id="grid-placeholder" class="text-muted py-5">
+          Set an anchor in the Explore tab, configure settings, then click <em>Generate Grid</em>.
+        </div>
+      </div>
+    </div>
+  </div>
+</div><!-- /tab-grid -->
+
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     TAB 4: ANALYSIS
+     KL spectrum · Factor correlation · MIG score
+═══════════════════════════════════════════════════════════════════════════ -->
+<div class="tab-pane fade" id="tab-analysis">
+  <div class="row g-3 mb-3">
+
+    <!-- KL spectrum -->
+    <div class="col-lg-6">
+      <div class="panel">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h6 class="fw-semibold mb-0">KL Activity Spectrum</h6>
+          <button class="btn btn-outline-primary btn-sm" onclick="computeKL()" id="btn-kl">
+            Compute
+          </button>
+        </div>
+        <div class="text-muted small mb-2">
+          Dims with KL &gt; 0.1 (blue) are "active" — they encode information.
+          Collapsed dims (grey) contribute nothing and are ignored by the decoder.
+        </div>
+        <div id="kl-spinner" style="display:none" class="py-2 text-muted small">
+          <span class="dot dot-spin me-1"></span> Encoding samples …
+        </div>
+        <div id="kl-error" class="small text-danger"></div>
+        <div id="kl-plot" class="plot-container"></div>
+      </div>
+    </div>
+
+    <!-- Correlation heatmap -->
+    <div class="col-lg-6">
+      <div class="panel">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h6 class="fw-semibold mb-0">Factor–Latent Correlation</h6>
+          <button class="btn btn-outline-primary btn-sm" onclick="computeCorr()" id="btn-corr">
+            Compute
+          </button>
+        </div>
+        <div class="text-muted small mb-2">
+          |Spearman ρ| between each latent μ and each ground-truth factor.
+          Perfect disentanglement → each column has exactly one bright cell.
+        </div>
+        <div id="corr-spinner" style="display:none" class="py-2 text-muted small">
+          <span class="dot dot-spin me-1"></span> Encoding samples …
+        </div>
+        <div id="corr-error" class="small text-danger"></div>
+        <div id="corr-plot" class="plot-container"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MIG score -->
+  <div class="row g-3">
+    <div class="col-12">
+      <div class="panel">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div>
+            <h6 class="fw-semibold mb-0">Mutual Information Gap (MIG)</h6>
+            <div class="text-muted small">
+              MIG ∈ [0, 1] — higher is more disentangled. Uses 3 000 random samples.
+              Takes 30–120 s to compute.
+            </div>
+          </div>
+          <button class="btn btn-outline-primary btn-sm" onclick="startMIG()" id="btn-mig">
+            Compute MIG
+          </button>
+        </div>
+        <div id="mig-spinner" style="display:none" class="py-2 text-muted small">
+          <span class="dot dot-spin me-1"></span>
+          Computing MI estimates (k-NN) … this takes a minute.
+        </div>
+        <div id="mig-error" class="small text-danger"></div>
+
+        <div id="mig-result" style="display:none">
+          <div class="d-flex align-items-baseline gap-4 mt-2 mb-3">
+            <div>
+              <div class="text-muted small">Overall MIG</div>
+              <div class="mig-score" id="mig-overall">—</div>
+            </div>
+            <div class="small text-muted">
+              MIG = (1/K) Σ_k [MI(z*, v_k) − MI(z₂, v_k)] / H(v_k)<br>
+              where z* is the most informative latent for factor v_k.
+            </div>
+          </div>
+          <div class="row g-2" id="mig-per-factor"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div><!-- /tab-analysis -->
+
+</div><!-- /tab-content -->
+</div><!-- /container -->
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let modelLoaded  = {{ 'true' if loaded_ckpt else 'false' }};
+let latentDim    = {{ loaded_latent_dim or 0 }};
+let anchorMu     = null;   // Float32Array
+let anchorLogvar = null;
+let anchorRecon  = null;   // b64 PNG of anchor reconstruction
+let currentMu    = null;   // from last encode_factors call
+let currentLogvar= null;
+let globalKL     = null;   // (latent_dim,) from /api/kl_spectrum
+let migPollTimer = null;
+const SHAPE_NAMES = ["square", "ellipse", "heart"];
+
+// ── Debounce ──────────────────────────────────────────────────────────────────
+function debounce(fn, ms) {
+  let t; return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+// ── Status bar ────────────────────────────────────────────────────────────────
+function setStatus(text, state) {  // state: loaded | unloaded | loading
+  const dot  = document.getElementById('status-dot');
+  const span = document.getElementById('status-text');
+  dot.className  = 'dot ' + (state === 'loaded' ? 'dot-green' : state === 'loading' ? 'dot-spin' : 'dot-red');
+  span.textContent = text;
+}
+
+// ── Load model ────────────────────────────────────────────────────────────────
+async function loadPreset(checkpoint, expId) {
+  document.querySelectorAll('.exp-card').forEach(c => c.classList.remove('loaded'));
+  await doLoad(checkpoint);
+  if (modelLoaded) document.getElementById(`exp-card-${expId}`).classList.add('loaded');
+}
+
+async function loadCustom() {
+  const ckpt = document.getElementById('custom-ckpt').value.trim();
+  if (!ckpt) return;
+  await doLoad(ckpt);
+}
+
+async function doLoad(checkpoint) {
+  setStatus('Loading …', 'loading');
+  document.getElementById('load-error').textContent = '';
+  try {
+    const r    = await fetch('/api/load', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({checkpoint})});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    modelLoaded = true;
+    latentDim   = data.latent_dim;
+    document.getElementById('load-info').innerHTML =
+      `<div class="text-success">&#10003; Loaded: <span class="font-monospace">${data.checkpoint}</span></div>
+       <div>latent_dim = ${latentDim}</div>`;
+    setStatus(`Loaded — z=${latentDim}`, 'loaded');
+    buildLatentSliders();
+    // Reset anchor state
+    anchorMu = anchorLogvar = anchorRecon = currentMu = currentLogvar = null;
+    document.getElementById('btn-anchor').disabled = true;
+    document.getElementById('traversal-panel').style.display = 'none';
+    // Trigger initial encoding
+    onFactorChange();
+  } catch(e) {
+    document.getElementById('load-error').textContent = e.message;
+    setStatus('Load failed', 'unloaded');
+  }
+}
+
+// ── Factor sliders ────────────────────────────────────────────────────────────
+function updateFactorLabels() {
+  const shape = parseInt(document.getElementById('f-shape').value);
+  const orient = parseInt(document.getElementById('f-orientation').value);
+  document.getElementById('v-shape').textContent = `${shape} (${SHAPE_NAMES[shape]})`;
+  document.getElementById('v-scale').textContent = document.getElementById('f-scale').value;
+  document.getElementById('v-orientation').textContent = `${Math.round(orient * 9)}° (${orient})`;
+  document.getElementById('v-pos_x').textContent = document.getElementById('f-pos_x').value;
+  document.getElementById('v-pos_y').textContent = document.getElementById('f-pos_y').value;
+}
+
+const doEncode = debounce(async () => {
+  if (!modelLoaded) return;
+  updateFactorLabels();
+  const payload = {
+    color: 0,
+    shape: parseInt(document.getElementById('f-shape').value),
+    scale: parseInt(document.getElementById('f-scale').value),
+    orientation: parseInt(document.getElementById('f-orientation').value),
+    pos_x: parseInt(document.getElementById('f-pos_x').value),
+    pos_y: parseInt(document.getElementById('f-pos_y').value),
+  };
+  try {
+    const r    = await fetch('/api/encode_factors', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data = await r.json();
+    if (!r.ok) { console.warn(data.error); return; }
+
+    setImg('orig-box',  data.original);
+    setImg('recon-box', data.reconstruction);
+    setImg('diff-box',  data.difference);
+    document.getElementById('encode-meta').textContent =
+      `MSE: ${data.mse.toFixed(5)}  |  sample #${data.sample_index || ''}`;
+
+    currentMu     = data.mu;
+    currentLogvar = data.logvar;
+    renderMuBars(data.mu, data.kl_per_dim);
+    document.getElementById('btn-anchor').disabled = false;
+  } catch(e) { console.error(e); }
+}, 120);
+
+function onFactorChange() { doEncode(); }
+
+function setImg(boxId, src) {
+  const box = document.getElementById(boxId);
+  box.innerHTML = `<img src="${src}" alt="">`;
+}
+
+function renderMuBars(mu, klDims) {
+  const container = document.getElementById('mu-bars');
+  const maxAbs    = Math.max(1, ...mu.map(Math.abs));
+  // Sort by KL descending for display
+  const order = klDims ? klDims.map((k,i)=>({k,i})).sort((a,b)=>b.k-a.k) : mu.map((_,i)=>({k:0,i}));
+  container.innerHTML = order.slice(0, Math.min(15, mu.length)).map(({k, i}) => {
+    const v   = mu[i];
+    const pct = (v / maxAbs) * 50 + 50;  // 0–100%
+    const col = v >= 0 ? '#2563eb' : '#dc2626';
+    const kls = klDims ? `<span class="kl-badge">KL=${k.toFixed(2)}</span>` : '';
+    return `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">
+      <span style="min-width:36px">z${i}</span>
+      <div style="flex:1;height:8px;background:#e5e7eb;border-radius:4px;position:relative">
+        <div style="position:absolute;height:100%;background:${col};border-radius:4px;
+                    left:${v>=0?50:pct}%;width:${Math.abs(v/maxAbs*50)}%;"></div>
+      </div>
+      <span style="min-width:42px;text-align:right;color:${col}">${v.toFixed(2)}</span>
+      ${kls}
+    </div>`;
+  }).join('');
+}
+
+// ── Anchor ────────────────────────────────────────────────────────────────────
+function setAsAnchor() {
+  if (!currentMu) return;
+  anchorMu     = [...currentMu];
+  anchorLogvar = [...currentLogvar];
+  // Snapshot the current reconstruction as anchor image
+  const recon  = document.getElementById('recon-box').querySelector('img');
+  anchorRecon  = recon ? recon.src : null;
+
+  // Show traversal panel
+  document.getElementById('traversal-panel').style.display = '';
+  if (anchorRecon) setImg('anchor-box', anchorRecon);
+
+  // Populate latent sliders with anchor μ values
+  populateLatentSlidersFromAnchor();
+  // Immediately decode anchor z (should be same as anchor recon)
+  decodeLatent();
+  document.getElementById('anchor-hint').textContent = '✓ Anchor set. Drag latent sliders to traverse.';
+}
+
+// ── Latent sliders ────────────────────────────────────────────────────────────
+function buildLatentSliders() {
+  const wrap = document.getElementById('latent-sliders');
+  wrap.innerHTML = '';
+  for (let i = 0; i < latentDim; i++) {
+    const row = document.createElement('div');
+    row.className = 'slider-row';
+    row.innerHTML = `
+      <span class="slider-lbl" id="lbl-z${i}">z${i}</span>
+      <input type="range" id="z-slider-${i}" min="-4" max="4" step="0.05" value="0"
+             oninput="onLatentChange(${i}, this.value)">
+      <span class="slider-val" id="zval-${i}">0.00</span>`;
+    wrap.appendChild(row);
+  }
+}
+
+function populateLatentSlidersFromAnchor() {
+  if (!anchorMu) return;
+  // Sort by global KL if available; otherwise by anchor's own KL
+  const kls = globalKL || anchorMu.map((_, i) => {
+    const lv = Math.min(Math.max(anchorLogvar[i], -10), 10);
+    return -0.5 * (1 + lv - anchorMu[i] ** 2 - Math.exp(lv));
+  });
+
+  // Re-order DOM sliders so highest-KL dims appear first
+  const order = kls.map((k, i) => ({k, i})).sort((a, b) => b.k - a.k);
+  const wrap  = document.getElementById('latent-sliders');
+  wrap.innerHTML = '';
+  order.forEach(({k, i}) => {
+    const v   = anchorMu[i];
+    const row = document.createElement('div');
+    row.className = 'slider-row';
+    row.innerHTML = `
+      <span class="slider-lbl" id="lbl-z${i}">z${i} <span class="kl-badge">KL=${k.toFixed(2)}</span></span>
+      <input type="range" id="z-slider-${i}" min="-4" max="4" step="0.05" value="${v.toFixed(3)}"
+             oninput="onLatentChange(${i}, this.value)">
+      <span class="slider-val" id="zval-${i}">${v.toFixed(2)}</span>`;
+    wrap.appendChild(row);
+  });
+}
+
+function onLatentChange(dimIdx, val) {
+  document.getElementById(`zval-${dimIdx}`).textContent = parseFloat(val).toFixed(2);
+  doDecode();
+}
+
+const doDecode = debounce(async () => {
+  if (!anchorMu) return;
+  // Collect current z values from sliders
+  const z = anchorMu.map((_, i) => {
+    const sl = document.getElementById(`z-slider-${i}`);
+    return sl ? parseFloat(sl.value) : anchorMu[i];
+  });
+  try {
+    const r    = await fetch('/api/decode', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({z})});
+    const data = await r.json();
+    if (!r.ok) return;
+    setImg('trav-box', data.reconstruction);
+  } catch(e) { console.error(e); }
+}, 80);
+
+function decodeLatent() { doDecode(); }
+
+function resetToAnchor() {
+  if (!anchorMu) return;
+  populateLatentSlidersFromAnchor();
+  doDecode();
+}
+
+// ── Traversal grid ────────────────────────────────────────────────────────────
+async function generateGrid() {
+  if (!anchorMu) {
+    document.getElementById('grid-error').textContent = 'Set an anchor in the Explore tab first.';
+    return;
+  }
+  document.getElementById('grid-error').textContent = '';
+  document.getElementById('grid-spinner').style.display = '';
+  document.getElementById('grid-img').style.display = 'none';
+  document.getElementById('grid-placeholder').style.display = 'none';
+
+  const payload = {
+    mu:               anchorMu,
+    logvar:           anchorLogvar,
+    n_steps:          parseInt(document.getElementById('g-steps').value),
+    sigma_range:      parseFloat(document.getElementById('g-range').value),
+    max_dims:         parseInt(document.getElementById('g-maxdims').value),
+    use_anchor_sigma: document.getElementById('g-anchor-sigma').checked,
+  };
+  try {
+    const r    = await fetch('/api/traversal_grid', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error);
+    const img = document.getElementById('grid-img');
+    img.src   = data.grid;
+    img.style.display = '';
+  } catch(e) {
+    document.getElementById('grid-error').textContent = e.message;
+  } finally {
+    document.getElementById('grid-spinner').style.display = 'none';
+  }
+}
+
+// ── KL spectrum ───────────────────────────────────────────────────────────────
+async function computeKL() {
+  if (!modelLoaded) return;
+  document.getElementById('kl-error').textContent = '';
+  document.getElementById('kl-spinner').style.display = '';
+  document.getElementById('btn-kl').disabled = true;
+  try {
+    const r    = await fetch('/api/kl_spectrum', {method:'POST'});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error);
+    Plotly.newPlot('kl-plot', data.data, data.layout, {responsive:true, displayModeBar:false});
+    // Cache KL for slider ordering
+    globalKL = data.data[0].y;
+  } catch(e) {
+    document.getElementById('kl-error').textContent = e.message;
+  } finally {
+    document.getElementById('kl-spinner').style.display = 'none';
+    document.getElementById('btn-kl').disabled = false;
+  }
+}
+
+// ── Correlation ───────────────────────────────────────────────────────────────
+async function computeCorr() {
+  if (!modelLoaded) return;
+  document.getElementById('corr-error').textContent = '';
+  document.getElementById('corr-spinner').style.display = '';
+  document.getElementById('btn-corr').disabled = true;
+  try {
+    const r    = await fetch('/api/correlation', {method:'POST'});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error);
+    Plotly.newPlot('corr-plot', data.data, data.layout, {responsive:true, displayModeBar:false});
+  } catch(e) {
+    document.getElementById('corr-error').textContent = e.message;
+  } finally {
+    document.getElementById('corr-spinner').style.display = 'none';
+    document.getElementById('btn-corr').disabled = false;
+  }
+}
+
+// ── MIG ───────────────────────────────────────────────────────────────────────
+async function startMIG() {
+  if (!modelLoaded) return;
+  document.getElementById('mig-error').textContent = '';
+  document.getElementById('mig-result').style.display = 'none';
+  document.getElementById('mig-spinner').style.display = '';
+  document.getElementById('btn-mig').disabled = true;
+  await fetch('/api/mig/start', {method:'POST'});
+  migPollTimer = setInterval(pollMIG, 2000);
+}
+
+async function pollMIG() {
+  try {
+    const r    = await fetch('/api/mig/status');
+    const data = await r.json();
+    if (data.status === 'done') {
+      clearInterval(migPollTimer);
+      document.getElementById('mig-spinner').style.display = 'none';
+      document.getElementById('btn-mig').disabled = false;
+      renderMIG(data.result);
+    } else if (data.status === 'error') {
+      clearInterval(migPollTimer);
+      document.getElementById('mig-spinner').style.display = 'none';
+      document.getElementById('btn-mig').disabled = false;
+      document.getElementById('mig-error').textContent = data.error || 'Unknown error';
+    }
+  } catch(e) { /* retry next tick */ }
+}
+
+function renderMIG(result) {
+  document.getElementById('mig-overall').textContent = result.score.toFixed(3);
+  const container = document.getElementById('mig-per-factor');
+  const entries   = Object.entries(result.per_factor).sort((a,b) => b[1] - a[1]);
+  container.innerHTML = entries.map(([name, val]) => {
+    const pct = Math.round(val * 100);
+    return `<div class="col-md-4 col-6">
+      <div class="small text-muted">${name}</div>
+      <div class="mig-bar"><div class="mig-fill" style="width:${Math.min(pct,100)}%"></div></div>
+      <div class="small fw-semibold">${val.toFixed(3)}</div>
+    </div>`;
+  }).join('');
+  document.getElementById('mig-result').style.display = '';
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  updateFactorLabels();
+  if (modelLoaded) {
+    setStatus(`Loaded — z=${latentDim}`, 'loaded');
+    buildLatentSliders();
+    onFactorChange();
+  } else {
+    setStatus('No model loaded', 'unloaded');
+  }
+});
+</script>
+</body>
+</html>

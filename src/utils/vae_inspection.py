@@ -64,22 +64,26 @@ def _extract_state_dict(payload: Any, module_name: str) -> dict[str, torch.Tenso
     if not isinstance(payload, dict):
         raise TypeError(f"Unsupported checkpoint payload type for {module_name}: {type(payload)!r}")
 
-    direct_keys = [
-        f"{module_name}_state_dict",
-        f"{module_name}_dict",
-        module_name,
-        "state_dict",
-        "model_state_dict",
-        "model",
-    ]
-    for key in direct_keys:
+    def _is_tensor_dict(d: Any) -> bool:
+        return isinstance(d, dict) and bool(d) and all(isinstance(v, torch.Tensor) for v in d.values())
+
+    # Module-specific keys are already scoped to this module — return as-is.
+    # Do NOT strip sub-prefixes: e.g. Encoder has a sub-module also named
+    # "encoder", so its state dict contains both "encoder.0.weight" AND
+    # "mu.weight". Stripping the "encoder." prefix would silently drop mu/logvar.
+    for key in (f"{module_name}_state_dict", f"{module_name}_dict"):
         value = payload.get(key)
-        if isinstance(value, dict) and value and all(isinstance(v, torch.Tensor) for v in value.values()):
-            state_dict = value
+        if _is_tensor_dict(value):
+            return value
+
+    # Generic keys may need prefix extraction to isolate this module's weights.
+    for key in (module_name, "state_dict", "model_state_dict", "model"):
+        value = payload.get(key)
+        if _is_tensor_dict(value):
             prefix = f"{module_name}."
-            if any(k.startswith(prefix) for k in state_dict):
-                return {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
-            return state_dict
+            if any(k.startswith(prefix) for k in value):
+                return {k[len(prefix):]: v for k, v in value.items() if k.startswith(prefix)}
+            return value
 
     prefix = f"{module_name}."
     prefixed = {k[len(prefix):]: v for k, v in payload.items() if k.startswith(prefix)}
