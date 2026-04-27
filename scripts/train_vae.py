@@ -16,6 +16,7 @@ from PIL import Image
 from sklearn.decomposition import PCA
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data
 from tqdm import tqdm
 import yaml
@@ -211,36 +212,40 @@ def _autocast_ctx(device: torch.device, enabled: bool):
 def train_epoch(vae, device, loader, optimizer, criterion, beta, *, amp: bool):
     vae.train()
     total_recon = total_kl = 0.0
+    total_samples = 0
     for x, _ in loader:
         x = x.to(device, non_blocking=True)
+        batch_size = x.shape[0]
         optimizer.zero_grad(set_to_none=True)
         with _autocast_ctx(device, amp):
-            x_hat, _, _ = vae(x)
+            x_hat, mu, logvar = vae(x)
             recon_loss = criterion(x_hat, x)
-            kl_loss    = vae.encoder.kl / x.shape[0]
+            kl_loss    = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
             loss       = recon_loss + beta * kl_loss
         loss.backward()
         optimizer.step()
-        total_recon += recon_loss.item()
-        total_kl    += kl_loss.item()
-    n = len(loader)
-    return total_recon / n, total_kl / n
+        total_recon  += recon_loss.item() * batch_size
+        total_kl     += kl_loss.item() * batch_size
+        total_samples += batch_size
+    return total_recon / total_samples, total_kl / total_samples
 
 
 def val_epoch(vae, device, loader, criterion, beta, *, amp: bool):
     vae.eval()
     total_recon = total_kl = 0.0
+    total_samples = 0
     with torch.no_grad():
         for x, _ in loader:
             x = x.to(device, non_blocking=True)
+            batch_size = x.shape[0]
             with _autocast_ctx(device, amp):
-                x_hat, _, _ = vae(x)
+                x_hat, mu, logvar = vae(x)
                 recon = criterion(x_hat, x)
-                kl    = vae.encoder.kl / x.shape[0]
-            total_recon += recon.item()
-            total_kl    += kl.item()
-    n = len(loader)
-    return total_recon / n, total_kl / n
+                kl    = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
+            total_recon  += recon.item() * batch_size
+            total_kl     += kl.item() * batch_size
+            total_samples += batch_size
+    return total_recon / total_samples, total_kl / total_samples
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +311,11 @@ def main():
         weight_decay=t_cfg["weight_decay"],
         fused=(device.type == "cuda"),
     )
-    criterion = nn.MSELoss()
+    # dSprites pixels are binary and the decoder ends in Sigmoid, so use the
+    # Bernoulli negative log-likelihood per sample. A global mean MSE makes the
+    # reconstruction term about 4096x smaller than the KL term on 64x64 images.
+    def criterion(x_hat, x):
+        return F.binary_cross_entropy(x_hat, x, reduction="sum") / x.shape[0]
 
     if not args.no_compile and device.type == "cuda":
         try:
@@ -326,6 +335,7 @@ def main():
         "lr":           t_cfg["lr"],
         "weight_decay": t_cfg["weight_decay"],
         "beta":         t_cfg["beta"],
+        "recon_loss":   "bce_sum_per_sample",
         "seed":         t_cfg["seed"],
         "train_frac":   d_cfg["train_frac"],
         "val_frac":     d_cfg["val_frac"],

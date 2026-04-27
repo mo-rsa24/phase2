@@ -61,13 +61,13 @@ def make_correlated_split(
     rng.shuffle(concordant_idx)
     n_train = int(len(concordant_idx) * train_frac)
     train_idx = concordant_idx[:n_train]
-    val_idx = np.concatenate([concordant_idx[n_train:], discordant_idx])
+    val_test_idx = np.concatenate([concordant_idx[n_train:], discordant_idx])
 
-    # Random split val_idx into val and test
-    rng.shuffle(val_idx)
-    n_val = len(val_idx) // 2
-    val_idx = val_idx[:n_val]
-    test_idx = val_idx[n_val:]
+    # Random split held-out/remaining candidates into validation and test.
+    rng.shuffle(val_test_idx)
+    n_val = len(val_test_idx) // 2
+    val_idx = val_test_idx[:n_val]
+    test_idx = val_test_idx[n_val:]
 
     return train_idx, val_idx, test_idx
 

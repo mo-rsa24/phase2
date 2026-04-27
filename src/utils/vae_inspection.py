@@ -105,7 +105,7 @@ def infer_encoder_config(state_dict: Mapping[str, torch.Tensor]) -> tuple[int, i
 
 def infer_decoder_config(state_dict: Mapping[str, torch.Tensor]) -> tuple[int, int]:
     latent_dim = int(state_dict["decoder.0.weight"].shape[1])
-    img_channels = int(state_dict["decoder.9.weight"].shape[1])
+    img_channels = int(state_dict["decoder.11.weight"].shape[1])
     return latent_dim, img_channels
 
 
