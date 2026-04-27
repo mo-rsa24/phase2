@@ -219,9 +219,9 @@ def train_epoch(vae, device, loader, optimizer, criterion, beta, *, amp: bool):
         optimizer.zero_grad(set_to_none=True)
         with _autocast_ctx(device, amp):
             x_hat, mu, logvar = vae(x)
-            recon_loss = criterion(x_hat, x)
-            kl_loss    = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
-            loss       = recon_loss + beta * kl_loss
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
+        recon_loss = criterion(x_hat.float(), x.float())
+        loss       = recon_loss + beta * kl_loss
         loss.backward()
         optimizer.step()
         total_recon  += recon_loss.item() * batch_size
@@ -240,8 +240,8 @@ def val_epoch(vae, device, loader, criterion, beta, *, amp: bool):
             batch_size = x.shape[0]
             with _autocast_ctx(device, amp):
                 x_hat, mu, logvar = vae(x)
-                recon = criterion(x_hat, x)
                 kl    = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
+            recon = criterion(x_hat.float(), x.float())
             total_recon  += recon.item() * batch_size
             total_kl     += kl.item() * batch_size
             total_samples += batch_size
