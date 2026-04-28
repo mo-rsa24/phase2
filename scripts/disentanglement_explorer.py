@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import base64
 import io
+import json
 import threading
 from pathlib import Path
 
@@ -36,7 +37,9 @@ import numpy as np
 import torch
 from flask import Flask, jsonify, render_template, request
 from PIL import Image
+from sklearn.feature_selection import mutual_info_classif
 
+from explorer_help import HELP
 from src.datasets.dsprites import FACTOR_NAMES, FACTOR_SIZES, load_dsprites
 from src.metrics.disentanglement import (
     compute_mig,
@@ -78,11 +81,15 @@ _state = {
     "device":     "cpu",
     "latent_dim": None,
     "ckpt_path":  None,
+    "beta":       None,    # β value of the loaded checkpoint (matched from EXPERIMENTS)
     # Cached batch encodings (filled in a background thread after load)
     "enc_mu":      None,   # (N, latent_dim)
     "enc_logvar":  None,   # (N, latent_dim)
     "enc_factors": None,   # (N, 6)
     "kl_arr":      None,   # (latent_dim,)
+    # Lazy: filled the first time `/api/factor_conditional_histogram` runs
+    "corr_matrix":           None,  # (latent_dim, 6) — |Spearman ρ|
+    "mig_top_dim_per_factor": {},   # {factor_name: int}
     # MIG background task
     "mig_status": "idle",  # idle | computing | done | error
     "mig_result": None,
@@ -136,6 +143,9 @@ def _cache_encoded_samples(n: int = 3000) -> None:
         _state["enc_logvar"]  = lv_arr
         _state["enc_factors"] = factors
         _state["kl_arr"]      = kl_per_dim(mu_arr, lv_arr)
+        # Invalidate derived caches that depend on the encoded samples
+        _state["corr_matrix"]           = None
+        _state["mig_top_dim_per_factor"] = {}
 
 
 # ── Flask ─────────────────────────────────────────────────────────────────────
@@ -150,7 +160,18 @@ def parse_args() -> argparse.Namespace:
 
 
 args = parse_args()
-app  = Flask(__name__, template_folder="templates")
+app  = Flask(__name__, template_folder="templates", static_folder="static")
+
+
+def _beta_for_checkpoint(ckpt_path: str | None) -> float | None:
+    """Look up β from EXPERIMENTS by exact checkpoint match (or None if unknown)."""
+    if not ckpt_path:
+        return None
+    p = str(ckpt_path)
+    for exp in EXPERIMENTS:
+        if exp["checkpoint"] in p:
+            return float(exp["beta"])
+    return None
 
 print("Loading dSprites …")
 _dataset      = load_dsprites(args.data_dir)
@@ -167,7 +188,9 @@ if args.checkpoint and Path(args.checkpoint).exists():
     )
     with _lock:
         _state.update(encoder=enc, decoder=dec,
-                      latent_dim=int(enc.latent_dim), ckpt_path=args.checkpoint)
+                      latent_dim=int(enc.latent_dim),
+                      ckpt_path=args.checkpoint,
+                      beta=_beta_for_checkpoint(args.checkpoint))
     threading.Thread(target=_cache_encoded_samples, daemon=True).start()
     print(f"Model preloaded: latent_dim={enc.latent_dim}")
 
@@ -183,6 +206,8 @@ def index():
         experiments=EXPERIMENTS,
         loaded_ckpt=_state["ckpt_path"],
         loaded_latent_dim=_state["latent_dim"],
+        loaded_beta=_state["beta"],
+        help_json=json.dumps(HELP),
     )
 
 
@@ -202,15 +227,22 @@ def api_load():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+    beta = _beta_for_checkpoint(str(path))
     with _lock:
         _state.update(
             encoder=enc, decoder=dec,
-            latent_dim=int(enc.latent_dim), ckpt_path=str(path),
+            latent_dim=int(enc.latent_dim), ckpt_path=str(path), beta=beta,
             enc_mu=None, enc_logvar=None, enc_factors=None, kl_arr=None,
+            corr_matrix=None, mig_top_dim_per_factor={},
             mig_status="idle", mig_result=None, mig_error=None,
         )
     threading.Thread(target=_cache_encoded_samples, daemon=True).start()
-    return jsonify({"ok": True, "latent_dim": _state["latent_dim"], "checkpoint": str(path)})
+    return jsonify({
+        "ok": True,
+        "latent_dim": _state["latent_dim"],
+        "checkpoint": str(path),
+        "beta":       beta,
+    })
 
 
 @app.route("/api/encode_factors", methods=["POST"])
@@ -452,6 +484,158 @@ def api_mig_status():
         if _state["mig_error"]:
             resp["error"] = _state["mig_error"]
     return jsonify(resp)
+
+
+# ── Phase-3 endpoints ─────────────────────────────────────────────────────────
+
+@app.route("/api/cached_encodings")
+def api_cached_encodings():
+    """Return cached encoder posterior μ + factor labels for the 2D scatter."""
+    with _lock:
+        mu      = _state["enc_mu"]
+        factors = _state["enc_factors"]
+    if mu is None or factors is None:
+        return jsonify({"ready": False})
+    return jsonify({
+        "ready": True,
+        "mu":           mu.tolist(),
+        "factors":      factors.tolist(),
+        "factor_names": list(FACTOR_NAMES),
+    })
+
+
+@app.route("/api/single_dim_traversal", methods=["POST"])
+def api_single_dim_traversal():
+    """Decode a 1-row latent traversal sweeping a single dim across ±range·σ."""
+    if _state["decoder"] is None:
+        return jsonify({"error": "No model loaded"}), 400
+
+    data    = request.json or {}
+    try:
+        dim     = int(data.get("dim", -1))
+        n_steps = int(data.get("n_steps", 9))
+        rng_sig = float(data.get("range_sigma", 3.0))
+        anchor_mu     = np.asarray(data.get("anchor_mu",     []), dtype=np.float32)
+        anchor_logvar = np.asarray(data.get("anchor_logvar", []), dtype=np.float32)
+    except Exception as e:
+        return jsonify({"error": f"bad payload: {e}"}), 400
+
+    if anchor_mu.size != _state["latent_dim"]:
+        return jsonify({"error": f"anchor_mu length {anchor_mu.size} != ldim"}), 400
+    if not (0 <= dim < _state["latent_dim"]):
+        return jsonify({"error": f"dim {dim} out of range"}), 400
+
+    sigma = float(np.exp(0.5 * np.clip(anchor_logvar[dim], -10, 10)))
+    z_values = np.linspace(
+        float(anchor_mu[dim]) - rng_sig * sigma,
+        float(anchor_mu[dim]) + rng_sig * sigma,
+        n_steps,
+    ).astype(np.float32)
+
+    decoder = _state["decoder"]
+    device  = args.device
+    images: list[str] = []
+    with torch.no_grad():
+        for v in z_values:
+            z = anchor_mu.copy()
+            z[dim] = float(v)
+            z_t = torch.from_numpy(z[np.newaxis]).float().to(device)
+            img = decoder(z_t).cpu().squeeze().numpy()
+            images.append(_b64png(img))
+
+    return jsonify({
+        "images":   images,
+        "z_values": z_values.tolist(),
+        "dim":      dim,
+        "anchor_mu_dim":     float(anchor_mu[dim]),
+        "anchor_sigma_dim":  sigma,
+    })
+
+
+def _ensure_corr_matrix() -> np.ndarray | None:
+    """Compute (and cache) the |Spearman ρ| matrix on cached encodings."""
+    with _lock:
+        cached = _state["corr_matrix"]
+        mu      = _state["enc_mu"]
+        factors = _state["enc_factors"]
+    if cached is not None:
+        return cached
+    if mu is None or factors is None:
+        return None
+    corr = factor_latent_correlation(mu, factors)
+    with _lock:
+        _state["corr_matrix"] = corr
+    return corr
+
+
+def _top_dim_for_factor(factor_name: str) -> tuple[int, str]:
+    """Pick the latent dim that best encodes the named factor.
+
+    Returns (dim, method) where method is "corr" for non-orientation factors and
+    "mi" for orientation (since orientation is cyclic and rank correlation
+    underestimates true alignment).
+    """
+    factor_idx = FACTOR_NAMES.index(factor_name)
+    with _lock:
+        mu      = _state["enc_mu"]
+        factors = _state["enc_factors"]
+        cached  = _state["mig_top_dim_per_factor"].get(factor_name)
+    if cached is not None:
+        method = "mi" if factor_name == "orientation" else "corr"
+        return int(cached), method
+    if mu is None or factors is None:
+        raise RuntimeError("Encoded samples not ready yet.")
+
+    if factor_name == "orientation":
+        mi = mutual_info_classif(mu, factors[:, factor_idx], discrete_features=False)
+        dim = int(np.argmax(mi))
+        method = "mi"
+    else:
+        corr = _ensure_corr_matrix()
+        dim = int(np.argmax(np.abs(corr[:, factor_idx])))
+        method = "corr"
+
+    with _lock:
+        _state["mig_top_dim_per_factor"][factor_name] = dim
+    return dim, method
+
+
+@app.route("/api/factor_conditional_histogram", methods=["POST"])
+def api_factor_conditional_histogram():
+    """Return μ samples grouped by factor value, for the dim that best encodes it."""
+    data        = request.json or {}
+    factor_name = str(data.get("factor", ""))
+    if factor_name not in FACTOR_NAMES:
+        return jsonify({"error": f"unknown factor: {factor_name}"}), 400
+    if FACTOR_SIZES[FACTOR_NAMES.index(factor_name)] <= 1:
+        return jsonify({"error": f"factor '{factor_name}' is constant"}), 400
+
+    with _lock:
+        mu      = _state["enc_mu"]
+        factors = _state["enc_factors"]
+    if mu is None or factors is None:
+        return jsonify({"error": "Still computing — try again in a moment."}), 503
+
+    try:
+        dim, method = _top_dim_for_factor(factor_name)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 503
+
+    factor_idx = FACTOR_NAMES.index(factor_name)
+    factor_col = factors[:, factor_idx]
+    mu_col     = mu[:, dim]
+    unique     = sorted(np.unique(factor_col).tolist())
+    histograms = [
+        {"value": int(v), "mu": mu_col[factor_col == v].tolist()}
+        for v in unique
+    ]
+    return jsonify({
+        "factor":           factor_name,
+        "factor_values":    unique,
+        "histograms":       histograms,
+        "dim_used":         int(dim),
+        "selection_method": method,
+    })
 
 
 # ── Launch ────────────────────────────────────────────────────────────────────

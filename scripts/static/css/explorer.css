@@ -1,0 +1,347 @@
+/* ── Base ─────────────────────────────────────────────────────────────────── */
+body { background:#f1f5f9; font-size:14px; }
+.navbar-brand { letter-spacing:.03em; font-size:1rem; }
+
+/* ── Image boxes ──────────────────────────────────────────────────────────── */
+.img-box {
+  background:#111;
+  border-radius:6px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  overflow:hidden;
+  aspect-ratio:1;
+  width:100%;
+}
+.img-box img {
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  image-rendering:pixelated;
+}
+.img-placeholder { color:#555; font-size:11px; text-align:center; padding:12px; }
+
+/* ── Cards / panels ───────────────────────────────────────────────────────── */
+.panel { background:#fff; border-radius:8px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+
+/* ── Run cards ────────────────────────────────────────────────────────────── */
+.exp-card { cursor:pointer; border:2px solid #e5e7eb !important; transition:border-color .15s; }
+.exp-card:hover  { border-color:#2563eb !important; }
+.exp-card.loaded { border-color:#16a34a !important; background:#f0fdf4; }
+
+/* ── Sliders ──────────────────────────────────────────────────────────────── */
+.slider-row { display:flex; align-items:center; gap:8px; margin:5px 0; }
+.slider-lbl { font-family:monospace; font-size:12px; min-width:110px; color:#374151; }
+.slider-val { font-family:monospace; font-size:12px; min-width:44px; text-align:right; color:#2563eb; }
+.kl-badge   { font-size:10px; color:#9ca3af; }
+input[type=range] { flex:1; accent-color:#2563eb; }
+
+/* ── Status dot ───────────────────────────────────────────────────────────── */
+.dot       { display:inline-block; width:9px; height:9px; border-radius:50%; }
+.dot-green { background:#16a34a; }
+.dot-red   { background:#dc2626; }
+.dot-spin  { background:#f59e0b; animation:pulse 1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+/* ── Tabs ─────────────────────────────────────────────────────────────────── */
+.nav-tabs .nav-link        { color:#6b7280; }
+.nav-tabs .nav-link.active { color:#1d4ed8; font-weight:600; }
+
+/* ── MIG metric ───────────────────────────────────────────────────────────── */
+.mig-score { font-size:2.5rem; font-weight:700; color:#1d4ed8; }
+.mig-bar   { height:18px; border-radius:4px; background:#dbeafe; margin:3px 0; cursor:pointer; transition:filter .15s; }
+.mig-bar:hover { filter:brightness(0.92); }
+.mig-fill  { height:100%; border-radius:4px; background:#2563eb; }
+.mig-row   { padding:6px 8px; border-radius:6px; transition:background .15s; }
+.mig-row:hover { background:#f3f4f6; }
+.mig-row.mig-row-hl { border:2px solid #1d4ed8; padding:4px 6px; }
+.mig-badge {
+  display:inline-block;
+  font-size:10px;
+  font-weight:600;
+  padding:1px 6px;
+  border-radius:10px;
+  margin-left:6px;
+}
+.mig-badge-green { background:#dcfce7; color:#166534; }
+.mig-badge-amber { background:#fef3c7; color:#92400e; }
+.mig-badge-red   { background:#fee2e2; color:#991b1b; }
+
+/* ── Grid image ───────────────────────────────────────────────────────────── */
+#grid-img { max-width:100%; border-radius:6px; image-rendering:pixelated; }
+
+/* ── Misc ─────────────────────────────────────────────────────────────────── */
+.small-mono           { font-family:monospace; font-size:11px; }
+.latent-sliders-wrap  { max-height:380px; overflow-y:auto; padding-right:4px; }
+
+/* ── Phase 1: Reset buttons + Δσ ──────────────────────────────────────────── */
+.btn-reset-z {
+  background:transparent;
+  border:1px solid #cbd5e1;
+  color:#64748b;
+  border-radius:4px;
+  padding:0 5px;
+  font-size:11px;
+  line-height:1.4;
+  cursor:pointer;
+  transition:all .15s;
+}
+.btn-reset-z:hover { background:#e0e7ff; color:#1d4ed8; border-color:#1d4ed8; }
+.btn-reset-z:disabled { opacity:.4; cursor:not-allowed; }
+
+.delta-sigma {
+  font-family:monospace;
+  font-size:10px;
+  min-width:48px;
+  text-align:right;
+  color:#9ca3af;
+  font-weight:500;
+}
+.delta-sigma.dsig-low    { color:#9ca3af; }
+.delta-sigma.dsig-mid    { color:#2563eb; }
+.delta-sigma.dsig-high   { color:#ea580c; }
+
+#latent-sliders-header {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:8px;
+  margin-bottom:6px;
+}
+#btn-reset-all {
+  font-size:11px;
+  padding:2px 10px;
+}
+
+/* ── Phase 1: Help icons + popovers ──────────────────────────────────────── */
+.help-icon {
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:16px;
+  height:16px;
+  font-size:10px;
+  font-weight:700;
+  background:#e0e7ff;
+  color:#1d4ed8;
+  border-radius:50%;
+  cursor:help;
+  margin-left:6px;
+  user-select:none;
+  transition:background .15s;
+  vertical-align:middle;
+}
+.help-icon:hover { background:#1d4ed8; color:#fff; }
+
+.popover { max-width:380px; }
+.popover-body { font-size:13px; line-height:1.45; }
+.popover-body p { margin-bottom:8px; }
+.popover-body p:last-child { margin-bottom:0; }
+.popover-body .formula-slot {
+  background:#f8fafc;
+  padding:8px 10px;
+  border-radius:4px;
+  margin:8px 0;
+  text-align:center;
+  font-size:14px;
+}
+
+/* Cross-link pulse on popover-shown */
+@keyframes help-pulse {
+  0%   { box-shadow:0 0 0 0 rgba(29, 78, 216, 0.6); }
+  70%  { box-shadow:0 0 0 12px rgba(29, 78, 216, 0); }
+  100% { box-shadow:0 0 0 0 rgba(29, 78, 216, 0); }
+}
+.help-pulse { animation:help-pulse 1.5s ease-out 1; }
+
+/* ── Phase 1: Help-mode term underlines ──────────────────────────────────── */
+.term-active {
+  border-bottom:1px dotted #1d4ed8;
+  cursor:help;
+}
+
+/* ── Phase 1: Objective strip ────────────────────────────────────────────── */
+#objective-strip {
+  background:#fff;
+  border-radius:8px;
+  padding:8px 14px;
+  margin-bottom:12px;
+  box-shadow:0 1px 3px rgba(0,0,0,.05);
+}
+#objective-strip > summary {
+  cursor:pointer;
+  font-weight:600;
+  font-size:13px;
+  color:#374151;
+  list-style:none;
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+#objective-strip > summary::before {
+  content:'▸';
+  color:#9ca3af;
+  transition:transform .15s;
+  display:inline-block;
+}
+#objective-strip[open] > summary::before { transform:rotate(90deg); }
+#objective-strip[open] > summary { margin-bottom:10px; }
+#objective-strip .objective-body { font-size:13px; color:#4b5563; }
+#objective-strip .objective-body .formula-display {
+  background:#f8fafc;
+  padding:14px;
+  border-radius:6px;
+  text-align:center;
+  font-size:18px;
+  margin:8px 0;
+}
+#objective-strip .objective-annotations { display:flex; gap:24px; flex-wrap:wrap; margin-top:8px; }
+#objective-strip .objective-annotations > div { flex:1; min-width:200px; }
+#objective-strip .objective-annotations > div b { color:#1d4ed8; }
+
+/* ── Phase 1.5: Analysis tab caveat banner ───────────────────────────────── */
+.alert-cyclic {
+  background:#fef3c7;
+  color:#78350f;
+  border:1px solid #fde68a;
+  border-radius:6px;
+  padding:8px 12px;
+  font-size:12px;
+  margin-bottom:8px;
+}
+
+.howto-line {
+  font-size:12px;
+  color:#6b7280;
+  font-style:italic;
+  margin-bottom:6px;
+}
+
+.formula-inline {
+  font-size:13px;
+  background:#f8fafc;
+  padding:6px 10px;
+  border-radius:4px;
+  margin-bottom:8px;
+  text-align:center;
+}
+
+/* ── Phase 2: μ panel — sparklines + bars ────────────────────────────────── */
+.mu-row {
+  display:flex;
+  align-items:center;
+  gap:6px;
+  padding:3px 0;
+  border-radius:4px;
+  cursor:default;
+}
+.mu-row:hover { background:#f3f4f6; }
+.mu-row .mu-label { min-width:30px; font-family:monospace; font-size:11px; color:#374151; }
+.mu-row .mu-bar-wrap {
+  flex:1;
+  height:10px;
+  background:#e5e7eb;
+  border-radius:4px;
+  position:relative;
+  overflow:visible;
+}
+.mu-row .mu-bar-fill {
+  position:absolute;
+  height:100%;
+  border-radius:4px;
+}
+.mu-row .mu-anchor-tick {
+  position:absolute;
+  top:-2px;
+  width:2px;
+  height:14px;
+  background:#9ca3af;
+}
+.mu-row .mu-spark { width:60px; height:18px; }
+.mu-row .mu-value {
+  min-width:48px;
+  text-align:right;
+  font-family:monospace;
+  font-size:11px;
+}
+.mu-row .mu-kl { font-size:10px; color:#9ca3af; min-width:54px; }
+.mu-row .mu-delta {
+  font-size:10px;
+  color:#9ca3af;
+  min-width:38px;
+  text-align:right;
+}
+.mu-sign-pos { color:#1d4ed8; }
+.mu-sign-neg { color:#dc2626; }
+
+/* ── Phase 2/3: Geometric viz cards ──────────────────────────────────────── */
+#geom-1d-card, #geom-2d-card { margin-top:12px; }
+.geom-controls {
+  display:flex;
+  gap:10px;
+  align-items:center;
+  margin-bottom:6px;
+  flex-wrap:wrap;
+}
+.geom-controls label {
+  font-size:11px;
+  color:#6b7280;
+  margin-bottom:0;
+}
+.geom-controls select {
+  font-size:12px;
+  padding:2px 6px;
+  height:auto;
+}
+
+/* ── Phase 3: Modals ─────────────────────────────────────────────────────── */
+#single-dim-modal .modal-body,
+#cond-hist-modal  .modal-body { padding:16px; }
+
+.single-dim-strip {
+  display:flex;
+  gap:4px;
+  justify-content:center;
+  flex-wrap:nowrap;
+  overflow-x:auto;
+  padding:8px 0;
+  background:#0f172a;
+  border-radius:6px;
+}
+.single-dim-strip .frame {
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:2px;
+}
+.single-dim-strip img {
+  width:64px; height:64px;
+  image-rendering:pixelated;
+  background:#000;
+  border-radius:3px;
+}
+.single-dim-strip .frame-label {
+  font-size:9px;
+  font-family:monospace;
+  color:#cbd5e1;
+}
+
+.kl-thumb-popover img {
+  width:48px; height:48px;
+  image-rendering:pixelated;
+  background:#000;
+  border-radius:3px;
+  margin:0 2px;
+}
+
+/* ── Help-mode toggle ─────────────────────────────────────────────────────── */
+.help-toggle-wrap {
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:12px;
+  color:#cbd5e1;
+}
+.help-toggle-wrap .form-check { margin:0; padding:0; min-height:auto; }
+.help-toggle-wrap .form-check-input { margin:0; cursor:pointer; }
+.help-toggle-wrap label { cursor:pointer; user-select:none; margin:0; }
