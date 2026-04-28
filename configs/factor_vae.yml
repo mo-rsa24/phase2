@@ -1,0 +1,39 @@
+# FactorVAE training configuration for dSprites
+# Usage: python scripts/train_factorvae.py --config configs/factor_vae.yml
+
+model:
+  latent_dim: 10
+  img_size: [1, 64, 64]   # dSprites is grayscale 64x64
+
+training:
+  epochs: 50
+  batch_size: 128
+  lr: 1.0e-4              # VAE branch — Kim & Mnih recommend 1e-4
+  weight_decay: 0.0       # paper uses 0 (Adam, no weight decay)
+  seed: 42
+  # FactorVAE-specific
+  gamma:           35.0   # TC weight; Kim & Mnih dSprites default
+  disc_lr:         1.0e-4 # discriminator Adam learning rate
+  disc_hidden_dim: 1000   # discriminator hidden width
+  disc_num_layers: 6      # discriminator depth (linear + leaky-relu blocks)
+
+data:
+  train_frac: 0.70
+  val_frac:   0.15
+  # test_frac: 0.15 (implicit)
+
+logging:
+  wandb_project: paper2-vae
+  log_interval:  5         # log recon grid + PCA manifold every N epochs
+  n_viz:         8         # images per row in reconstruction grid
+  pca_samples:   5000      # val samples to encode for PCA manifold
+
+# Selected by `train_factorvae.py --runtime <key>`. Overrides batch_size and num_workers.
+# CLI flags still win over these.
+runtime:
+  hippo:                   # 1x RTX 5090 (32 GB)
+    batch_size: 1024
+    num_workers: 6
+  cluster48:               # mscluster106 / mscluster107 (2x 48 GB cards)
+    batch_size: 2048
+    num_workers: 8

@@ -29,6 +29,35 @@ body { background:#f1f5f9; font-size:14px; }
 .exp-card:hover  { border-color:#2563eb !important; }
 .exp-card.loaded { border-color:#16a34a !important; background:#f0fdf4; }
 
+.exp-group { margin-bottom:14px; }
+.exp-group-header {
+  display:flex;
+  align-items:baseline;
+  gap:10px;
+  padding:6px 4px 8px 4px;
+  border-bottom:1px solid #e5e7eb;
+  margin-bottom:8px;
+}
+.exp-group-title {
+  font-weight:600;
+  font-size:13px;
+  color:#1d4ed8;
+}
+.exp-group-sub { font-size:11px; color:#6b7280; }
+
+.exp-badge-corr {
+  background:#fef3c7;
+  color:#92400e;
+  border:1px solid #fde68a;
+  font-weight:500;
+}
+.exp-badge-heldout {
+  background:#e0e7ff;
+  color:#3730a3;
+  border:1px solid #c7d2fe;
+  font-weight:500;
+}
+
 /* ── Sliders ──────────────────────────────────────────────────────────────── */
 .slider-row { display:flex; align-items:center; gap:8px; margin:5px 0; }
 .slider-lbl { font-family:monospace; font-size:12px; min-width:110px; color:#374151; }
@@ -159,6 +188,36 @@ input[type=range] { flex:1; accent-color:#2563eb; }
   border-bottom:1px dotted #1d4ed8;
   cursor:help;
 }
+
+/* ── Phase 2b: Provenance bar ────────────────────────────────────────────── */
+.prov-bar {
+  background:#fff;
+  border:1px solid #e5e7eb;
+  border-radius:8px;
+  padding:6px 14px;
+  margin-bottom:10px;
+  font-size:11px;
+  display:flex;
+  flex-wrap:wrap;
+  align-items:baseline;
+  gap:6px;
+  box-shadow:0 1px 2px rgba(0,0,0,.04);
+}
+.prov-bar .prov-label {
+  color:#9ca3af;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+  font-size:10px;
+}
+.prov-bar .prov-value {
+  color:#1f2937;
+  font-weight:500;
+}
+.prov-bar .prov-value.split-iid        { color:#2563eb; }
+.prov-bar .prov-value.split-correlated { color:#b45309; }
+.prov-bar .prov-value.split-heldout    { color:#3730a3; }
+.prov-bar .prov-value.split-unknown    { color:#9ca3af; font-style:italic; }
+.prov-bar .prov-divider { color:#d1d5db; }
 
 /* ── Phase 1: Objective strip ────────────────────────────────────────────── */
 #objective-strip {
@@ -294,6 +353,41 @@ input[type=range] { flex:1; accent-color:#2563eb; }
   height:auto;
 }
 
+/* 2D scatter side-panel (hover/click → original + recon) */
+.geom-2d-row {
+  display:flex;
+  gap:14px;
+  align-items:flex-start;
+  flex-wrap:wrap;
+}
+.geom-2d-plot-wrap { flex:1 1 420px; min-width:0; }
+.geom-2d-side {
+  flex:0 0 168px;
+  background:#f8fafc;
+  border-radius:8px;
+  padding:10px;
+  border:1px solid #e5e7eb;
+  position:sticky;
+  top:8px;
+}
+.geom-thumb { width:128px; height:128px; margin:0 auto; }
+#geom-2d-factors {
+  font-family:monospace;
+  font-size:11px;
+  color:#374151;
+  background:#fff;
+  border-radius:4px;
+  padding:6px 8px;
+  border:1px solid #e5e7eb;
+  line-height:1.5;
+}
+#geom-2d-factors .factor-name { color:#6b7280; }
+#geom-2d-factors .factor-rq   { font-weight:600; color:#1d4ed8; }
+.geom-2d-side.pinned {
+  background:#eff6ff;
+  border-color:#93c5fd;
+}
+
 /* ── Phase 3: Modals ─────────────────────────────────────────────────────── */
 #single-dim-modal .modal-body,
 #cond-hist-modal  .modal-body { padding:16px; }
@@ -332,6 +426,70 @@ input[type=range] { flex:1; accent-color:#2563eb; }
   background:#000;
   border-radius:3px;
   margin:0 2px;
+}
+
+/* ── Phase 2b: Compare tab ───────────────────────────────────────────────── */
+.compare-pin-card {
+  display:inline-flex;
+  flex-direction:column;
+  background:#f8fafc;
+  border:1px solid #cbd5e1;
+  border-radius:6px;
+  padding:6px 10px;
+  font-size:11px;
+  max-width:280px;
+}
+.compare-pin-card .pin-label { font-weight:600; color:#1f2937; }
+.compare-pin-card .pin-meta  { color:#6b7280; font-size:10px; }
+.compare-pin-card .pin-close {
+  background:transparent; border:none; color:#9ca3af;
+  font-size:14px; cursor:pointer; line-height:1;
+  padding:0; margin-left:4px;
+}
+.compare-pin-card .pin-close:hover { color:#dc2626; }
+
+.compare-pin-card.split-iid        { border-left:4px solid #2563eb; }
+.compare-pin-card.split-correlated { border-left:4px solid #b45309; }
+.compare-pin-card.split-heldout    { border-left:4px solid #3730a3; }
+
+.compare-table-wrap { overflow-x:auto; }
+.compare-table {
+  width:100%;
+  font-size:12px;
+  border-collapse:collapse;
+}
+.compare-table th, .compare-table td {
+  padding:6px 8px;
+  border-bottom:1px solid #e5e7eb;
+  text-align:left;
+  white-space:nowrap;
+}
+.compare-table th {
+  background:#f1f5f9;
+  font-weight:600;
+  color:#374151;
+  position:sticky;
+  top:0;
+}
+.compare-table td.numeric  { text-align:right; font-family:monospace; }
+.compare-table .row-split-iid        { background:#eff6ff20; }
+.compare-table .row-split-correlated { background:#fef3c720; }
+.compare-table .row-split-heldout    { background:#e0e7ff20; }
+.compare-table .warn-flag { color:#dc2626; font-weight:700; }
+.compare-table .green     { color:#166534; font-weight:600; }
+.compare-table .amber     { color:#92400e; font-weight:600; }
+.compare-table .red       { color:#991b1b; font-weight:600; }
+
+.compare-deepdive-card {
+  background:#fff;
+  border:1px solid #e5e7eb;
+  border-radius:8px;
+  padding:10px;
+}
+.compare-deepdive-card .header {
+  font-size:12px;
+  font-weight:600;
+  margin-bottom:4px;
 }
 
 /* ── Help-mode toggle ─────────────────────────────────────────────────────── */

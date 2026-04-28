@@ -27,6 +27,7 @@ import argparse
 import base64
 import io
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from sklearn.feature_selection import mutual_info_classif
 
 from explorer_help import HELP
 from src.datasets.dsprites import FACTOR_NAMES, FACTOR_SIZES, load_dsprites
+from src.metrics.dci import compute_dci
 from src.metrics.disentanglement import (
     compute_mig,
     factor_latent_correlation,
@@ -57,18 +59,53 @@ from src.utils.vae_inspection import (
 # ── Sweep experiment presets ──────────────────────────────────────────────────
 
 EXPERIMENTS = [
+    # ---- Phase 2a: IID baseline (Exp 1–5) ------------------------------
     {"id": 1, "label": "Exp 1 — z=10, β=1.0", "purpose": "Baseline VAE",
+     "split": "iid",
      "latent_dim": 10, "beta": 1.0, "seed": 42,
      "checkpoint": "checkpoints/vae/vae_z10_beta1.0_seed42/best.pt"},
     {"id": 2, "label": "Exp 2 — z=10, β=4.0", "purpose": "β-VAE",
+     "split": "iid",
      "latent_dim": 10, "beta": 4.0, "seed": 42,
      "checkpoint": "checkpoints/vae/vae_z10_beta4.0_seed42/best.pt"},
     {"id": 3, "label": "Exp 3 — z=4, β=1.0",  "purpose": "Undercomplete",
+     "split": "iid",
      "latent_dim":  4, "beta": 1.0, "seed": 42,
      "checkpoint": "checkpoints/vae/vae_z4_beta1.0_seed42/best.pt"},
     {"id": 4, "label": "Exp 4 — z=20, β=1.0", "purpose": "Overcomplete",
+     "split": "iid",
      "latent_dim": 20, "beta": 1.0, "seed": 42,
      "checkpoint": "checkpoints/vae/vae_z20_beta1.0_seed42/best.pt"},
+    {"id": 5, "label": "Exp 5 — z=10, γ=35.0", "purpose": "FactorVAE",
+     "split": "iid",
+     "latent_dim": 10, "beta": None, "gamma": 35.0, "seed": 42,
+     "checkpoint": "checkpoints/factor_vae/factorvae_z10_gamma35.0_seed42/best.pt"},
+    # ---- Phase 2b: correlated (scale, orientation+) split (Exp 6–10) ---
+    {"id": 6, "label": "Exp 6 — corr · z=10, β=1.0", "purpose": "Baseline VAE (corr)",
+     "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
+     "corr_direction": "positive",
+     "latent_dim": 10, "beta": 1.0, "seed": 42,
+     "checkpoint": "checkpoints/vae/correlated_vae_z10_beta1.0_seed42/best.pt"},
+    {"id": 7, "label": "Exp 7 — corr · z=10, β=4.0", "purpose": "β-VAE (corr)",
+     "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
+     "corr_direction": "positive",
+     "latent_dim": 10, "beta": 4.0, "seed": 42,
+     "checkpoint": "checkpoints/vae/correlated_vae_z10_beta4.0_seed42/best.pt"},
+    {"id": 8, "label": "Exp 8 — corr · z=4, β=1.0",  "purpose": "Undercomplete (corr)",
+     "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
+     "corr_direction": "positive",
+     "latent_dim":  4, "beta": 1.0, "seed": 42,
+     "checkpoint": "checkpoints/vae/correlated_vae_z4_beta1.0_seed42/best.pt"},
+    {"id": 9, "label": "Exp 9 — corr · z=20, β=1.0", "purpose": "Overcomplete (corr)",
+     "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
+     "corr_direction": "positive",
+     "latent_dim": 20, "beta": 1.0, "seed": 42,
+     "checkpoint": "checkpoints/vae/correlated_vae_z20_beta1.0_seed42/best.pt"},
+    {"id": 10, "label": "Exp 10 — corr · z=10, γ=35.0", "purpose": "FactorVAE (corr)",
+     "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
+     "corr_direction": "positive",
+     "latent_dim": 10, "beta": None, "gamma": 35.0, "seed": 42,
+     "checkpoint": "checkpoints/factor_vae/correlated_factorvae_z10_gamma35.0_seed42/best.pt"},
 ]
 
 
@@ -82,11 +119,17 @@ _state = {
     "latent_dim": None,
     "ckpt_path":  None,
     "beta":       None,    # β value of the loaded checkpoint (matched from EXPERIMENTS)
+    "gamma":      None,    # γ (FactorVAE) of the loaded checkpoint, if applicable
+    "split":      None,    # 'iid' / 'correlated' / 'heldout' / None (unknown)
+    "corr_factor_a":   None,
+    "corr_factor_b":   None,
+    "corr_direction":  None,
     # Cached batch encodings (filled in a background thread after load)
-    "enc_mu":      None,   # (N, latent_dim)
-    "enc_logvar":  None,   # (N, latent_dim)
-    "enc_factors": None,   # (N, 6)
-    "kl_arr":      None,   # (latent_dim,)
+    "enc_mu":       None,  # (N, latent_dim)
+    "enc_logvar":   None,  # (N, latent_dim)
+    "enc_factors":  None,  # (N, 6)
+    "enc_indices":  None,  # (N,) — original dSprites dataset indices for cached samples
+    "kl_arr":       None,  # (latent_dim,)
     # Lazy: filled the first time `/api/factor_conditional_histogram` runs
     "corr_matrix":           None,  # (latent_dim, 6) — |Spearman ρ|
     "mig_top_dim_per_factor": {},   # {factor_name: int}
@@ -94,6 +137,10 @@ _state = {
     "mig_status": "idle",  # idle | computing | done | error
     "mig_result": None,
     "mig_error":  None,
+    # DCI background task (same state machine as MIG)
+    "dci_status": "idle",
+    "dci_result": None,
+    "dci_error":  None,
 }
 
 _dataset:      dict | None = None
@@ -142,6 +189,7 @@ def _cache_encoded_samples(n: int = 3000) -> None:
         _state["enc_mu"]      = mu_arr
         _state["enc_logvar"]  = lv_arr
         _state["enc_factors"] = factors
+        _state["enc_indices"] = idx
         _state["kl_arr"]      = kl_per_dim(mu_arr, lv_arr)
         # Invalidate derived caches that depend on the encoded samples
         _state["corr_matrix"]           = None
@@ -163,15 +211,58 @@ args = parse_args()
 app  = Flask(__name__, template_folder="templates", static_folder="static")
 
 
-def _beta_for_checkpoint(ckpt_path: str | None) -> float | None:
-    """Look up β from EXPERIMENTS by exact checkpoint match (or None if unknown)."""
-    if not ckpt_path:
-        return None
-    p = str(ckpt_path)
+def _seeds_by_exp() -> dict[int, list[dict]]:
+    """Discover available seeds on disk for each EXPERIMENTS entry.
+
+    For each experiment, glob the checkpoint path with the seed segment
+    replaced by a wildcard (e.g. ``vae_z10_beta1.0_seed*/best.pt``) and
+    parse the seed back from each match. Returns ``{exp.id: [{seed, path}, ...]}``
+    sorted ascending by seed. Empty list if no checkpoints exist yet.
+    """
+    result: dict[int, list[dict]] = {}
     for exp in EXPERIMENTS:
-        if exp["checkpoint"] in p:
-            return float(exp["beta"])
-    return None
+        ckpt = exp["checkpoint"]
+        pattern = re.sub(r"_seed\d+/", "_seed*/", ckpt)
+        seeds: list[dict] = []
+        for match in Path(".").glob(pattern):
+            mm = re.search(r"_seed(\d+)/", str(match))
+            if mm:
+                seeds.append({"seed": int(mm.group(1)), "checkpoint": str(match)})
+        seeds.sort(key=lambda s: s["seed"])
+        result[exp["id"]] = seeds
+    return result
+
+
+def _disent_param_for_checkpoint(ckpt_path: str | None) -> dict:
+    """Look up disentanglement hyperparameters + split for a checkpoint path.
+
+    Returns a dict with keys 'beta', 'gamma', 'split', 'corr_factor_a',
+    'corr_factor_b', 'corr_direction'. Values are None when unknown
+    (custom path not in EXPERIMENTS, or fields irrelevant to the family).
+    """
+    empty = {
+        "beta": None, "gamma": None, "split": None,
+        "corr_factor_a": None, "corr_factor_b": None, "corr_direction": None,
+    }
+    if not ckpt_path:
+        return empty
+    # Compare seed-agnostic forms so non-default seeds still resolve to their
+    # parent experiment's β/γ/split metadata.
+    p_norm = re.sub(r"_seed\d+/", "_seed*/", str(ckpt_path))
+    for exp in EXPERIMENTS:
+        exp_norm = re.sub(r"_seed\d+/", "_seed*/", exp["checkpoint"])
+        if exp_norm in p_norm:
+            beta  = exp.get("beta")
+            gamma = exp.get("gamma")
+            return {
+                "beta":  float(beta)  if beta  is not None else None,
+                "gamma": float(gamma) if gamma is not None else None,
+                "split": exp.get("split"),
+                "corr_factor_a":  exp.get("corr_factor_a"),
+                "corr_factor_b":  exp.get("corr_factor_b"),
+                "corr_direction": exp.get("corr_direction"),
+            }
+    return empty
 
 print("Loading dSprites …")
 _dataset      = load_dsprites(args.data_dir)
@@ -186,11 +277,17 @@ if args.checkpoint and Path(args.checkpoint).exists():
         decoder_checkpoint=args.checkpoint,
         device=args.device,
     )
+    _params = _disent_param_for_checkpoint(args.checkpoint)
     with _lock:
         _state.update(encoder=enc, decoder=dec,
                       latent_dim=int(enc.latent_dim),
                       ckpt_path=args.checkpoint,
-                      beta=_beta_for_checkpoint(args.checkpoint))
+                      beta=_params["beta"],
+                      gamma=_params["gamma"],
+                      split=_params["split"],
+                      corr_factor_a=_params["corr_factor_a"],
+                      corr_factor_b=_params["corr_factor_b"],
+                      corr_direction=_params["corr_direction"])
     threading.Thread(target=_cache_encoded_samples, daemon=True).start()
     print(f"Model preloaded: latent_dim={enc.latent_dim}")
 
@@ -204,9 +301,15 @@ def index():
         factor_names=list(FACTOR_NAMES),
         factor_sizes=list(FACTOR_SIZES),
         experiments=EXPERIMENTS,
+        seeds_by_exp=_seeds_by_exp(),
         loaded_ckpt=_state["ckpt_path"],
         loaded_latent_dim=_state["latent_dim"],
         loaded_beta=_state["beta"],
+        loaded_gamma=_state["gamma"],
+        loaded_split=_state["split"],
+        loaded_corr_a=_state["corr_factor_a"],
+        loaded_corr_b=_state["corr_factor_b"],
+        loaded_corr_direction=_state["corr_direction"],
         help_json=json.dumps(HELP),
     )
 
@@ -227,21 +330,33 @@ def api_load():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    beta = _beta_for_checkpoint(str(path))
+    params = _disent_param_for_checkpoint(str(path))
     with _lock:
         _state.update(
             encoder=enc, decoder=dec,
-            latent_dim=int(enc.latent_dim), ckpt_path=str(path), beta=beta,
-            enc_mu=None, enc_logvar=None, enc_factors=None, kl_arr=None,
+            latent_dim=int(enc.latent_dim), ckpt_path=str(path),
+            beta=params["beta"], gamma=params["gamma"],
+            split=params["split"],
+            corr_factor_a=params["corr_factor_a"],
+            corr_factor_b=params["corr_factor_b"],
+            corr_direction=params["corr_direction"],
+            enc_mu=None, enc_logvar=None, enc_factors=None,
+            enc_indices=None, kl_arr=None,
             corr_matrix=None, mig_top_dim_per_factor={},
             mig_status="idle", mig_result=None, mig_error=None,
+            dci_status="idle", dci_result=None, dci_error=None,
         )
     threading.Thread(target=_cache_encoded_samples, daemon=True).start()
     return jsonify({
-        "ok": True,
+        "ok":         True,
         "latent_dim": _state["latent_dim"],
         "checkpoint": str(path),
-        "beta":       beta,
+        "beta":       params["beta"],
+        "gamma":      params["gamma"],
+        "split":      params["split"],
+        "corr_factor_a":  params["corr_factor_a"],
+        "corr_factor_b":  params["corr_factor_b"],
+        "corr_direction": params["corr_direction"],
     })
 
 
@@ -486,6 +601,72 @@ def api_mig_status():
     return jsonify(resp)
 
 
+# ── DCI (background task) ────────────────────────────────────────────────────
+#
+# Same state machine as MIG: idle → computing → done | error. The metric
+# typically takes ~10–30 s on 3000 cached samples (RF n_estimators=50).
+# Reads from `_state["enc_mu"]` and `_state["enc_factors"]`.
+
+def _run_dci() -> None:
+    with _lock:
+        mu      = _state["enc_mu"]
+        factors = _state["enc_factors"]
+    if mu is None or factors is None:
+        with _lock:
+            _state["dci_status"] = "error"
+            _state["dci_error"]  = "No encoded samples available yet."
+        return
+    try:
+        result = compute_dci(
+            mu, factors,
+            factor_names=FACTOR_NAMES,
+            factor_sizes=FACTOR_SIZES,
+            n_estimators=50,
+            seed=0,
+        )
+        # numpy → JSON-friendly
+        payload = {
+            "importance":   result["importance"].tolist(),
+            "D_per_latent": result["D_per_latent"].tolist(),
+            "D":            float(result["D"]),
+            "C_per_factor": result["C_per_factor"].tolist(),
+            "C":            float(result["C"]),
+            "I_per_factor": result["I_per_factor"].tolist(),
+            "I":            float(result["I"]),
+            "factor_names": list(result["factor_names"]),
+        }
+        with _lock:
+            _state["dci_result"] = payload
+            _state["dci_status"] = "done"
+    except Exception as e:
+        with _lock:
+            _state["dci_status"] = "error"
+            _state["dci_error"]  = str(e)
+
+
+@app.route("/api/dci/start", methods=["POST"])
+def api_dci_start():
+    with _lock:
+        if _state["dci_status"] == "computing":
+            return jsonify({"status": "computing"})
+        _state["dci_status"] = "computing"
+        _state["dci_result"] = None
+        _state["dci_error"]  = None
+    threading.Thread(target=_run_dci, daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/api/dci/status")
+def api_dci_status():
+    with _lock:
+        resp = {"status": _state["dci_status"]}
+        if _state["dci_result"]:
+            resp["result"] = _state["dci_result"]
+        if _state["dci_error"]:
+            resp["error"] = _state["dci_error"]
+    return jsonify(resp)
+
+
 # ── Phase-3 endpoints ─────────────────────────────────────────────────────────
 
 @app.route("/api/cached_encodings")
@@ -501,6 +682,42 @@ def api_cached_encodings():
         "mu":           mu.tolist(),
         "factors":      factors.tolist(),
         "factor_names": list(FACTOR_NAMES),
+    })
+
+
+@app.route("/api/cached_sample/<int:cache_idx>")
+def api_cached_sample(cache_idx: int):
+    """Return the original image, decoded reconstruction, and ground-truth
+    factors for one cached encoding. Used by the 2D scatter hover/click panel.
+    """
+    with _lock:
+        indices = _state["enc_indices"]
+        mu      = _state["enc_mu"]
+        factors = _state["enc_factors"]
+        decoder = _state["decoder"]
+    if indices is None or mu is None or decoder is None:
+        return jsonify({"error": "Cache not ready"}), 503
+    if not (0 <= cache_idx < len(indices)):
+        return jsonify({"error": f"cache_idx {cache_idx} out of range"}), 400
+
+    dataset_idx = int(indices[cache_idx])
+    original    = _dataset["imgs"][dataset_idx].astype(np.float32)
+
+    z   = mu[cache_idx]
+    z_t = torch.from_numpy(z[np.newaxis]).float().to(args.device)
+    with torch.no_grad():
+        recon = decoder(z_t).cpu().squeeze().numpy()
+
+    factor_dict = {
+        name: int(factors[cache_idx, i])
+        for i, name in enumerate(FACTOR_NAMES)
+    }
+    return jsonify({
+        "cache_idx":      cache_idx,
+        "dataset_idx":    dataset_idx,
+        "original":       _b64png(original),
+        "reconstruction": _b64png(recon),
+        "factors":        factor_dict,
     })
 
 
@@ -636,6 +853,132 @@ def api_factor_conditional_histogram():
         "dim_used":         int(dim),
         "selection_method": method,
     })
+
+
+# ── Phase-2b: Compare endpoint ────────────────────────────────────────────────
+#
+# The Compare tab can pin up to 4 checkpoints and view their metrics
+# side-by-side. We compute KL/correlation/MIG/DCI for each pinned checkpoint
+# *without* mutating the main `_state` (so the user's currently-loaded
+# checkpoint and its cached encodings aren't disturbed).
+#
+# Each call loads the encoder, encodes 3000 random samples, and runs all
+# four metrics. Result is cached by checkpoint path so repeat hits are free.
+
+_compare_cache: dict[str, dict] = {}
+_compare_lock = threading.Lock()
+
+
+def _compute_compare_metrics(ckpt_path: str, n_samples: int = 3000) -> dict:
+    """Encode a checkpoint and compute its summary metrics.
+
+    Cached by path so subsequent calls are free.
+    """
+    with _compare_lock:
+        if ckpt_path in _compare_cache:
+            return _compare_cache[ckpt_path]
+
+    enc, _dec = load_encoder_decoder(
+        encoder_checkpoint=ckpt_path,
+        decoder_checkpoint=ckpt_path,
+        device=args.device,
+    )
+    enc.eval()
+    rng = np.random.RandomState(0)
+    idx = rng.choice(len(_dataset["imgs"]),
+                     min(n_samples, len(_dataset["imgs"])),
+                     replace=False)
+    imgs    = _dataset["imgs"][idx].astype(np.float32)
+    factors = _dataset["latents_classes"][idx]
+
+    mu_list, lv_list = [], []
+    with torch.no_grad():
+        for i in range(0, len(imgs), 512):
+            x = torch.from_numpy(imgs[i:i+512][:, np.newaxis]).float().to(args.device)
+            mu_b, lv_b = enc.encode(x)
+            mu_list.append(mu_b.cpu().numpy())
+            lv_list.append(lv_b.cpu().numpy())
+    mu_arr = np.concatenate(mu_list)
+    lv_arr = np.concatenate(lv_list)
+
+    kl = kl_per_dim(mu_arr, lv_arr)
+    corr = factor_latent_correlation(mu_arr, factors)
+    try:
+        mig_score, mig_per_factor = compute_mig(mu_arr, factors)
+    except Exception:
+        mig_score, mig_per_factor = float("nan"), {}
+    try:
+        dci_result = compute_dci(
+            mu_arr, factors,
+            factor_names=FACTOR_NAMES,
+            factor_sizes=FACTOR_SIZES,
+            n_estimators=30, seed=0,
+        )
+        dci = {
+            "D": float(dci_result["D"]),
+            "C": float(dci_result["C"]),
+            "I": float(dci_result["I"]),
+            "C_per_factor": dci_result["C_per_factor"].tolist(),
+            "I_per_factor": dci_result["I_per_factor"].tolist(),
+            "factor_names": list(dci_result["factor_names"]),
+        }
+    except Exception as e:
+        dci = {"error": str(e)}
+
+    metrics = {
+        "checkpoint": ckpt_path,
+        "latent_dim": int(enc.latent_dim),
+        "kl_per_dim": kl.tolist(),
+        "active_dims": int((kl > 0.1).sum()),
+        "corr_max_per_factor": [float(np.abs(corr[:, k]).max())
+                                for k in range(corr.shape[1])],
+        "corr_top_dim_per_factor": [int(np.argmax(np.abs(corr[:, k])))
+                                     for k in range(corr.shape[1])],
+        "factor_names": list(FACTOR_NAMES),
+        "mig":         float(mig_score),
+        "mig_per_factor": mig_per_factor,
+        "dci":         dci,
+    }
+
+    with _compare_lock:
+        _compare_cache[ckpt_path] = metrics
+    return metrics
+
+
+@app.route("/api/compare/metrics", methods=["POST"])
+def api_compare_metrics():
+    """Compute (or return cached) summary metrics for a checkpoint.
+
+    Body: {"checkpoint": "checkpoints/.../best.pt"}.
+    Used by the Compare tab to pin checkpoints. May take 30-60s the first
+    time per checkpoint, then instant.
+    """
+    data = request.json or {}
+    p    = (data.get("checkpoint") or "").strip()
+    if not p:
+        return jsonify({"error": "No checkpoint path provided"}), 400
+    if not Path(p).exists():
+        return jsonify({"error": f"File not found: {p}"}), 404
+    try:
+        m = _compute_compare_metrics(p)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Match against EXPERIMENTS for split / β / γ provenance.
+    params = _disent_param_for_checkpoint(p)
+    m["beta"]            = params["beta"]
+    m["gamma"]           = params["gamma"]
+    m["split"]           = params["split"]
+    m["corr_factor_a"]   = params["corr_factor_a"]
+    m["corr_factor_b"]   = params["corr_factor_b"]
+    m["corr_direction"]  = params["corr_direction"]
+    return jsonify(m)
+
+
+@app.route("/api/experiments")
+def api_experiments():
+    """Return the EXPERIMENTS table to the front-end (used by Compare picker)."""
+    return jsonify({"experiments": EXPERIMENTS})
 
 
 # ── Launch ────────────────────────────────────────────────────────────────────

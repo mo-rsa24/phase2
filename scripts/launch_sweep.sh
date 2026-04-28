@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
-# Launch the 4-cell VAE disentanglement sweep on a chosen node.
+# Launch the 10-cell disentanglement sweep on a chosen node.
 #
-#   --node hippo         → 4 experiments sequentially on GPU 0
-#   --node mscluster106  → exp 1 + exp 2 in parallel on GPU 0 / GPU 1
-#   --node mscluster107  → exp 3 + exp 4 in parallel on GPU 0 / GPU 1
+# IID baseline (cells 1–5):
+#   --node hippo         → 5 IID experiments sequentially on GPU 0
+#   --node mscluster106  → IID exps 1+2 in parallel on GPU 0 / GPU 1
+#   --node mscluster107  → IID exps 3+4 in parallel on GPU 0 / GPU 1
+#   --node mscluster108  → IID exp 5 (FactorVAE) on GPU 0
+#
+# Phase 2b — correlated split (cells 6–10):
+#   --node hippo-corr        → 5 correlated experiments sequentially on GPU 0
+#   --node mscluster106-corr → corr exps 6+7 in parallel
+#   --node mscluster107-corr → corr exps 8+9 in parallel
+#   --node mscluster108-corr → corr exp 10 (FactorVAE) on GPU 0
+#
+# Phase 2c — γ × recon sweep at 150 epochs (cells 11–13):
+#   --node hippo-gamma   → γ∈{10,20,35} sequentially on GPU 0 (~2h total)
 #
 # Assumes phase2-repr micromamba env, this repo, data/dsprites.npz, and
 # `wandb login` are already set up on the node.
@@ -17,7 +28,7 @@ cd "$PROJECT_ROOT"
 NODE=""
 SEED=42
 EPOCHS=""
-OUT_DIR="checkpoints/vae"
+OUT_DIR=""           # empty = let sweep_disentanglement pick per-trainer default
 DRY_RUN=0
 NO_COMPILE=0
 ENV_NAME="${ENV_NAME:-phase2-repr}"
@@ -30,9 +41,11 @@ Required:
   --node NODE         Which node we are running on (drives GPU mapping + runtime overlay).
 
 Options:
-  --seed N            Seed for all 4 runs (default: $SEED).
-  --epochs N          Epoch override (default: from configs/vae.yaml).
-  --out-dir PATH      Checkpoints root (default: $OUT_DIR).
+  --seed N            Seed for all runs (default: $SEED).
+  --epochs N          Epoch override (default: from per-trainer YAML).
+  --out-dir PATH      Checkpoints root (default: per-trainer:
+                      checkpoints/vae for VAE cells,
+                      checkpoints/factor_vae for FactorVAE cells).
   --no-compile        Disable torch.compile (escape hatch).
   --dry-run           Print the per-experiment commands without running.
   -h, --help          This help.
@@ -67,7 +80,7 @@ fi
 case "$NODE" in
     hippo)
         RUNTIME="hippo"
-        ASSIGNMENTS=("1 0" "2 0" "3 0" "4 0")   # sequential on GPU 0
+        ASSIGNMENTS=("1 0" "2 0" "3 0" "4 0" "5 0")
         PARALLEL=0
         ;;
     mscluster106)
@@ -80,11 +93,54 @@ case "$NODE" in
         ASSIGNMENTS=("3 0" "4 1")
         PARALLEL=1
         ;;
+    mscluster108)
+        RUNTIME="cluster48"
+        ASSIGNMENTS=("5 0")
+        PARALLEL=0
+        ;;
+    # ---- Phase 2b: correlated split (cells 6–10) -----------------------
+    hippo-corr)
+        RUNTIME="hippo"
+        ASSIGNMENTS=("6 0" "7 0" "8 0" "9 0" "10 0")
+        PARALLEL=0
+        ;;
+    mscluster106-corr)
+        RUNTIME="cluster48"
+        ASSIGNMENTS=("6 0" "7 1")
+        PARALLEL=1
+        ;;
+    mscluster107-corr)
+        RUNTIME="cluster48"
+        ASSIGNMENTS=("8 0" "9 1")
+        PARALLEL=1
+        ;;
+    mscluster108-corr)
+        RUNTIME="cluster48"
+        ASSIGNMENTS=("10 0")
+        PARALLEL=0
+        ;;
+    # ---- Phase 2c: γ-sweep at 150 epochs (cells 11–13), hippo only ------
+    hippo-gamma)
+        RUNTIME="hippo"
+        ASSIGNMENTS=("11 0" "12 0" "13 0")
+        PARALLEL=0
+        ;;
     *)
-        echo "ERROR: --node must be one of hippo|mscluster106|mscluster107 (got: $NODE)." >&2
+        echo "ERROR: --node must be one of:" >&2
+        echo "  hippo|mscluster106|mscluster107|mscluster108" >&2
+        echo "  hippo-corr|mscluster106-corr|mscluster107-corr|mscluster108-corr" >&2
+        echo "  hippo-gamma" >&2
+        echo "(got: $NODE)" >&2
         exit 2
         ;;
 esac
+
+# The bash launcher passes --node $NODE to sweep_disentanglement.py, which
+# in turn validates against a fixed list of node tags used as wandb tags.
+# The "-corr" / "-gamma" variants are bash-launcher-only routing aliases;
+# strip the suffix when forwarding the tag downstream.
+NODE_TAG="${NODE%-corr}"
+NODE_TAG="${NODE_TAG%-gamma}"
 
 # ---- Locate micromamba ----------------------------------------------------
 if command -v micromamba >/dev/null 2>&1; then
@@ -96,22 +152,51 @@ else
     exit 1
 fi
 
-# ---- Sweep table (id:latent_dim:beta:purpose) -----------------------------
-declare -A EXP_LATENT EXP_BETA EXP_PURPOSE
-EXP_LATENT[1]=10;  EXP_BETA[1]=1.0;  EXP_PURPOSE[1]="baseline"
-EXP_LATENT[2]=10;  EXP_BETA[2]=4.0;  EXP_PURPOSE[2]="beta-vae"
-EXP_LATENT[3]=4;   EXP_BETA[3]=1.0;  EXP_PURPOSE[3]="undercomplete"
-EXP_LATENT[4]=20;  EXP_BETA[4]=1.0;  EXP_PURPOSE[4]="overcomplete"
+# ---- Sweep table (mirror of EXPERIMENTS in sweep_disentanglement.py) -----
+declare -A EXP_TRAINER EXP_SPLIT EXP_LATENT EXP_BETA EXP_GAMMA EXP_PURPOSE
+# IID baseline (cells 1–5)
+EXP_TRAINER[1]="vae";        EXP_SPLIT[1]="iid";        EXP_LATENT[1]=10; EXP_BETA[1]=1.0;   EXP_PURPOSE[1]="baseline"
+EXP_TRAINER[2]="vae";        EXP_SPLIT[2]="iid";        EXP_LATENT[2]=10; EXP_BETA[2]=4.0;   EXP_PURPOSE[2]="beta-vae"
+EXP_TRAINER[3]="vae";        EXP_SPLIT[3]="iid";        EXP_LATENT[3]=4;  EXP_BETA[3]=1.0;   EXP_PURPOSE[3]="undercomplete"
+EXP_TRAINER[4]="vae";        EXP_SPLIT[4]="iid";        EXP_LATENT[4]=20; EXP_BETA[4]=1.0;   EXP_PURPOSE[4]="overcomplete"
+EXP_TRAINER[5]="factor_vae"; EXP_SPLIT[5]="iid";        EXP_LATENT[5]=10; EXP_GAMMA[5]=35.0; EXP_PURPOSE[5]="factor-vae"
+# Correlated split (cells 6–10)
+EXP_TRAINER[6]="vae";        EXP_SPLIT[6]="correlated"; EXP_LATENT[6]=10; EXP_BETA[6]=1.0;   EXP_PURPOSE[6]="baseline-corr"
+EXP_TRAINER[7]="vae";        EXP_SPLIT[7]="correlated"; EXP_LATENT[7]=10; EXP_BETA[7]=4.0;   EXP_PURPOSE[7]="beta-vae-corr"
+EXP_TRAINER[8]="vae";        EXP_SPLIT[8]="correlated"; EXP_LATENT[8]=4;  EXP_BETA[8]=1.0;   EXP_PURPOSE[8]="undercomplete-corr"
+EXP_TRAINER[9]="vae";        EXP_SPLIT[9]="correlated"; EXP_LATENT[9]=20; EXP_BETA[9]=1.0;   EXP_PURPOSE[9]="overcomplete-corr"
+EXP_TRAINER[10]="factor_vae"; EXP_SPLIT[10]="correlated"; EXP_LATENT[10]=10; EXP_GAMMA[10]=35.0; EXP_PURPOSE[10]="factor-vae-corr"
+# γ × recon-quality sweep at 150 epochs (cells 11–13) — name_suffix keeps
+# these from colliding with cell 5's checkpoint dir.
+declare -A EXP_SUFFIX
+EXP_TRAINER[11]="factor_vae"; EXP_SPLIT[11]="iid"; EXP_LATENT[11]=10; EXP_GAMMA[11]=10.0; EXP_PURPOSE[11]="factor-vae-gsweep"; EXP_SUFFIX[11]="e150"
+EXP_TRAINER[12]="factor_vae"; EXP_SPLIT[12]="iid"; EXP_LATENT[12]=10; EXP_GAMMA[12]=20.0; EXP_PURPOSE[12]="factor-vae-gsweep"; EXP_SUFFIX[12]="e150"
+EXP_TRAINER[13]="factor_vae"; EXP_SPLIT[13]="iid"; EXP_LATENT[13]=10; EXP_GAMMA[13]=35.0; EXP_PURPOSE[13]="factor-vae-gsweep"; EXP_SUFFIX[13]="e150"
 
 run_name_for() {
     local exp_id=$1
-    echo "vae_z${EXP_LATENT[$exp_id]}_beta${EXP_BETA[$exp_id]}_seed${SEED}"
+    local base
+    if [[ "${EXP_TRAINER[$exp_id]}" == "factor_vae" ]]; then
+        base="factorvae_z${EXP_LATENT[$exp_id]}_gamma${EXP_GAMMA[$exp_id]}_seed${SEED}"
+    else
+        base="vae_z${EXP_LATENT[$exp_id]}_beta${EXP_BETA[$exp_id]}_seed${SEED}"
+    fi
+    if [[ -n "${EXP_SUFFIX[$exp_id]:-}" ]]; then
+        base="${base}_${EXP_SUFFIX[$exp_id]}"
+    fi
+    if [[ "${EXP_SPLIT[$exp_id]}" == "iid" ]]; then
+        echo "$base"
+    else
+        echo "${EXP_SPLIT[$exp_id]}_${base}"
+    fi
 }
 
 LOG_DIR="$PROJECT_ROOT/logs/sweep"
 mkdir -p "$LOG_DIR"
 
 # ---- Build the python command for a single experiment --------------------
+# OUT_DIR is left unset by default so sweep_disentanglement.py can pick the
+# per-trainer default (checkpoints/vae or checkpoints/factor_vae).
 python_cmd() {
     local exp_id=$1
     local cmd=(
@@ -119,10 +204,10 @@ python_cmd() {
         python -u "$PROJECT_ROOT/scripts/sweep_disentanglement.py"
         --experiment-id "$exp_id"
         --runtime "$RUNTIME"
-        --node "$NODE"
+        --node "$NODE_TAG"
         --seed "$SEED"
-        --out-dir "$OUT_DIR"
     )
+    [[ -n "$OUT_DIR"  ]] && cmd+=(--out-dir "$OUT_DIR")
     [[ -n "$EPOCHS"   ]] && cmd+=(--epochs "$EPOCHS")
     [[ "$NO_COMPILE" == 1 ]] && cmd+=(--no-compile)
     printf '%q ' "${cmd[@]}"

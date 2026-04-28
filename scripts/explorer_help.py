@@ -264,6 +264,100 @@ HELP: dict[str, dict] = {
         "links": ["#mig-per-factor"],
     },
 
+    # ── DCI metric (Eastwood & Williams 2018) ──────────────────────────────
+    "dci": {
+        "title": "DCI (Disentanglement / Completeness / Informativeness)",
+        "short": "Three complementary scores from a Random-Forest importance matrix R(latent × factor).",
+        "long": (
+            "<p>For each ground-truth factor, a Random Forest is trained to "
+            "predict it from the latents <i>μ</i>. The forest's "
+            "<b>feature_importances_</b> form a matrix R[i, k] of how much "
+            "latent <i>i</i> contributes to predicting factor <i>k</i>.</p>"
+            "<p>Three scores are derived:</p>"
+            "<ul><li><b>D</b>isentanglement: per-latent — is each dim "
+            "concentrated on one factor?</li>"
+            "<li><b>C</b>ompleteness: per-factor — is each factor "
+            "concentrated in one dim?</li>"
+            "<li><b>I</b>nformativeness: per-factor — can the factor be "
+            "predicted at all? (held-out R²)</li></ul>"
+            "<p>D and C address different failure modes: high D + low C = "
+            "clean dims but factors are split; low D + high C = factors "
+            "are localised but each dim multiplexes; both high = "
+            "axis-aligned.</p>"
+        ),
+        "links": ["#dci-panel"],
+    },
+    "dci_d": {
+        "title": "Disentanglement (D)",
+        "short": "Per-latent: does this dim concentrate its predictive power on a single factor?",
+        "long": (
+            "<p>For latent dim <i>i</i>, normalise its row in the importance "
+            "matrix to a probability vector P_i, then:</p>"
+            "<p>D_i = 1 − H(P_i) / log K, with K = number of factors.</p>"
+            "<p>D = 1 means the dim's importance is concentrated on a single "
+            "factor (P_i is one-hot). D = 0 means the dim spreads its "
+            "importance evenly across all K factors.</p>"
+            "<p>Overall D is an importance-weighted mean — uninformative "
+            "dims do not dilute the score.</p>"
+        ),
+        "formula": (
+            r"D_i = 1 - \frac{H(P_i)}{\log K}, \quad "
+            r"P_i = \frac{R[i, :]}{\sum_k R[i, k]}"
+        ),
+        "links": ["#dci-d"],
+    },
+    "dci_c": {
+        "title": "Completeness (C)",
+        "short": "Per-factor: is this factor's representation concentrated in a single latent dim?",
+        "long": (
+            "<p>For factor <i>k</i>, normalise its column in the importance "
+            "matrix to a probability vector P_k, then:</p>"
+            "<p>C_k = 1 − H(P_k) / log d, with d = latent_dim.</p>"
+            "<p>C = 1 means the factor lives in one dim. C = 0 means it is "
+            "split equally across every dim.</p>"
+            "<p>For your RQ, scale and orientation should each have high C."
+            " Low C on either means the factor is multi-dim entangled — even "
+            "if MIG is moderate.</p>"
+        ),
+        "formula": (
+            r"C_k = 1 - \frac{H(P_k)}{\log d}, \quad "
+            r"P_k = \frac{R[:, k]}{\sum_i R[i, k]}"
+        ),
+        "links": ["#dci-c"],
+    },
+    "dci_i": {
+        "title": "Informativeness (I)",
+        "short": "Per-factor: can this factor be predicted from the latents at all? (held-out R²)",
+        "long": (
+            "<p>Held-out R² of the regressor that predicts factor <i>k</i> "
+            "from <i>μ</i>. I = 1 → perfect prediction; I = 0 → as good as "
+            "predicting the factor's mean.</p>"
+            "<p>Low I means the factor isn't encoded anywhere. A model can "
+            "have high D and high C but low I — meaning the latents are "
+            "<i>structured</i> but the structure isn't <i>informative</i>. "
+            "All three are needed.</p>"
+        ),
+        "formula": r"I_k = \max\bigl(0,\ R^2_{\text{test}}(\hat v_k(\mu),\, v_k)\bigr)",
+        "links": ["#dci-i"],
+    },
+    "importance": {
+        "title": "Feature importance matrix",
+        "short": "R[i, k] = importance of latent dim i for predicting factor k (from a Random Forest).",
+        "long": (
+            "<p>The heart of DCI. A 2D matrix where each cell measures how "
+            "much a Random Forest relies on a given latent dim to predict a "
+            "given factor.</p>"
+            "<p>Read like the |Spearman ρ| heatmap: ideal = exactly one "
+            "bright cell per column (each factor owned by one dim) and at "
+            "most one per row (each dim owns at most one factor).</p>"
+            "<p>RF importance is non-linear (handles non-monotonic encodings "
+            "better than Spearman) but treats the factor as a continuous "
+            "regression target — for cyclic factors like orientation it "
+            "still under-counts. Cross-check with the conditional histogram.</p>"
+        ),
+        "links": ["#dci-heatmap"],
+    },
+
     # ── Other ────────────────────────────────────────────────────────────────
     "traversal": {
         "title": "Latent traversal",

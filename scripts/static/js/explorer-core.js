@@ -42,7 +42,21 @@ async function loadPreset(checkpoint, expId) {
   await doLoad(checkpoint);
   if (window.modelLoaded) {
     document.getElementById(`exp-card-${expId}`).classList.add('loaded');
+    const btn = document.getElementById(`seed-dd-${expId}`);
+    const m   = checkpoint.match(/_seed(\d+)\//);
+    if (btn && m) btn.textContent = `seed=${m[1]}`;
   }
+}
+
+async function loadSeed(expId, seed, checkpoint) {
+  await loadPreset(checkpoint, expId);
+}
+
+// Card-level click delegate: ignore clicks that originated inside the seed
+// dropdown (Bootstrap handles those itself), otherwise load the default seed.
+function onExpCardClick(event, checkpoint, expId) {
+  if (event.target.closest('.dropdown')) return;
+  loadPreset(checkpoint, expId);
 }
 
 async function loadCustom() {
@@ -70,9 +84,25 @@ async function doLoad(checkpoint) {
        <div>latent_dim = ${window.latentDim}</div>`;
     setStatus(`Loaded — z=${window.latentDim}`, 'loaded');
 
-    // Refresh objective strip with the matched β value
+    // Refresh objective strip with the matched β / γ values
     if (typeof updateObjectiveStrip === 'function') {
-      updateObjectiveStrip(data.beta, data.checkpoint);
+      updateObjectiveStrip(data.beta, data.checkpoint, data.gamma);
+    }
+    // Refresh provenance bar with the new run's metadata.
+    if (typeof updateProvenanceBar === 'function') {
+      const isFactor = (data.checkpoint || '').includes('factorvae') ||
+                       (data.checkpoint || '').includes('factor_vae');
+      updateProvenanceBar({
+        ckpt:      data.checkpoint,
+        split:     data.split,
+        corrA:     data.corr_factor_a,
+        corrB:     data.corr_factor_b,
+        corrDir:   data.corr_direction,
+        beta:      data.beta,
+        gamma:     data.gamma,
+        latentDim: data.latent_dim,
+        model:     isFactor ? 'FactorVAE' : 'VAE',
+      });
     }
 
     buildLatentSliders();
@@ -134,8 +164,12 @@ const doEncode = debounce(async () => {
     window.currentMu     = data.mu;
     window.currentLogvar = data.logvar;
     window.currentKLDims = data.kl_per_dim;
-    renderMuBars(data.mu, data.logvar, data.kl_per_dim);
+    // Enable the anchor button as soon as we have a valid encoding — don't
+    // gate it on the μ-bar render, which can throw on first paint (Bootstrap
+    // Tooltip init on freshly-created rows).
     document.getElementById('btn-anchor').disabled = false;
+    try { renderMuBars(data.mu, data.logvar, data.kl_per_dim); }
+    catch (e) { console.error('renderMuBars failed:', e); }
 
     if (typeof refreshGeom1D === 'function') refreshGeom1D();
     if (typeof refreshGeom2DPosterior === 'function') refreshGeom2DPosterior();

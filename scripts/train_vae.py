@@ -28,6 +28,10 @@ from src.datasets.dsprites import (
     load_dsprites,
     make_iid_split,
 )
+from src.datasets.correlated_dsprites import (
+    make_correlated_split,
+    make_heldout_pair_split,
+)
 from src.models.vae import VAE
 
 
@@ -43,6 +47,25 @@ def parse_args():
     p.add_argument("--epochs",          type=int,   default=None)
     p.add_argument("--batch-size",      type=int,   default=None)
     p.add_argument("--num-workers",     type=int,   default=None)
+    # Dataset split selection (Phase 2b/2e).
+    p.add_argument("--split",           type=str, default="iid",
+                   choices=["iid", "correlated", "heldout"],
+                   help="Which dSprites split to train on.")
+    p.add_argument("--corr-factor-a",   type=str, default="scale",
+                   help="First correlated factor (when --split=correlated).")
+    p.add_argument("--corr-factor-b",   type=str, default="orientation",
+                   help="Second correlated factor (when --split=correlated).")
+    p.add_argument("--corr-direction",  type=str, default="positive",
+                   choices=["positive", "negative"],
+                   help="Direction of injected correlation (when --split=correlated).")
+    p.add_argument("--heldout-factor-a", type=str, default="shape",
+                   help="First factor of held-out cells (when --split=heldout).")
+    p.add_argument("--heldout-factor-b", type=str, default="scale",
+                   help="Second factor of held-out cells (when --split=heldout).")
+    p.add_argument("--heldout-a-vals",   type=int, nargs="*", default=[2],
+                   help="Held-out values for factor A (when --split=heldout).")
+    p.add_argument("--heldout-b-vals",   type=int, nargs="*", default=[4, 5],
+                   help="Held-out values for factor B (when --split=heldout).")
     # Runtime overlay key in configs/vae.yaml -> runtime.{key}.
     p.add_argument("--runtime",         type=str,   default=None,
                    help="Runtime overlay key (e.g. 'hippo', 'cluster48').")
@@ -285,12 +308,40 @@ def main():
 
     # --- Data ---
     dataset = load_dsprites(args.data_dir)
-    train_idx, val_idx, _ = make_iid_split(
-        dataset,
-        train_frac=d_cfg["train_frac"],
-        val_frac=d_cfg["val_frac"],
-        seed=t_cfg["seed"],
-    )
+    heldout_idx = None  # populated only when --split=heldout
+    if args.split == "iid":
+        train_idx, val_idx, _ = make_iid_split(
+            dataset,
+            train_frac=d_cfg["train_frac"],
+            val_frac=d_cfg["val_frac"],
+            seed=t_cfg["seed"],
+        )
+        print(f"[data] split=iid  train={len(train_idx)}  val={len(val_idx)}")
+    elif args.split == "correlated":
+        train_idx, val_idx, _ = make_correlated_split(
+            dataset,
+            factor_a=args.corr_factor_a,
+            factor_b=args.corr_factor_b,
+            correlation=args.corr_direction,
+            train_frac=d_cfg["train_frac"],
+            seed=t_cfg["seed"],
+        )
+        print(f"[data] split=correlated({args.corr_factor_a},{args.corr_factor_b},"
+              f"{args.corr_direction})  train={len(train_idx)}  val={len(val_idx)}")
+    elif args.split == "heldout":
+        train_idx, val_idx, _, heldout_idx = make_heldout_pair_split(
+            dataset,
+            factor_a=args.heldout_factor_a,
+            factor_b=args.heldout_factor_b,
+            held_a_vals=args.heldout_a_vals,
+            held_b_vals=args.heldout_b_vals,
+            seed=t_cfg["seed"],
+        )
+        print(f"[data] split=heldout({args.heldout_factor_a}={args.heldout_a_vals},"
+              f"{args.heldout_factor_b}={args.heldout_b_vals})  "
+              f"train={len(train_idx)}  val={len(val_idx)}  heldout={len(heldout_idx)}")
+    else:
+        raise ValueError(f"unknown split: {args.split}")
     train_ds = DSpritesDataset(dataset, train_idx)
     val_ds   = DSpritesDataset(dataset, val_idx)
     loader_kwargs = dict(
@@ -341,6 +392,15 @@ def main():
         "val_frac":     d_cfg["val_frac"],
         "num_workers":  num_workers,
         "amp_dtype":    "bfloat16" if amp_enabled else "fp32",
+        # Dataset split metadata.
+        "split":             args.split,
+        "corr_factor_a":     args.corr_factor_a if args.split == "correlated" else None,
+        "corr_factor_b":     args.corr_factor_b if args.split == "correlated" else None,
+        "corr_direction":    args.corr_direction if args.split == "correlated" else None,
+        "heldout_factor_a":  args.heldout_factor_a if args.split == "heldout" else None,
+        "heldout_factor_b":  args.heldout_factor_b if args.split == "heldout" else None,
+        "heldout_a_vals":    list(args.heldout_a_vals) if args.split == "heldout" else None,
+        "heldout_b_vals":    list(args.heldout_b_vals) if args.split == "heldout" else None,
         "experiment_id": args.experiment_id,
         "purpose":       args.purpose,
         "sweep_name":    args.wandb_group,
@@ -402,31 +462,31 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(
-                {
-                    "epoch":                epoch,
-                    "model_state_dict":     vae.state_dict(),
-                    "encoder_state_dict":   vae.encoder.state_dict(),
-                    "decoder_state_dict":   vae.decoder.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss":             val_loss,
-                    "config":               flat_cfg,
-                },
-                best_ckpt,
-            )
+            ckpt_dict = {
+                "epoch":                epoch,
+                "model_state_dict":     vae.state_dict(),
+                "encoder_state_dict":   vae.encoder.state_dict(),
+                "decoder_state_dict":   vae.decoder.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss":             val_loss,
+                "config":               flat_cfg,
+            }
+            if heldout_idx is not None:
+                ckpt_dict["heldout_idx"] = heldout_idx.tolist()
+            torch.save(ckpt_dict, best_ckpt)
 
     # --- Final checkpoint + artifact ---
     final_ckpt = out_dir / "final.pt"
-    torch.save(
-        {
-            "epoch":              t_cfg["epochs"],
-            "model_state_dict":   vae.state_dict(),
-            "encoder_state_dict": vae.encoder.state_dict(),
-            "decoder_state_dict": vae.decoder.state_dict(),
-            "config":             flat_cfg,
-        },
-        final_ckpt,
-    )
+    final_dict = {
+        "epoch":              t_cfg["epochs"],
+        "model_state_dict":   vae.state_dict(),
+        "encoder_state_dict": vae.encoder.state_dict(),
+        "decoder_state_dict": vae.decoder.state_dict(),
+        "config":             flat_cfg,
+    }
+    if heldout_idx is not None:
+        final_dict["heldout_idx"] = heldout_idx.tolist()
+    torch.save(final_dict, final_ckpt)
 
     artifact = wandb.Artifact(name="vae-checkpoint", type="model")
     artifact.add_file(str(final_ckpt))

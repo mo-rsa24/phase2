@@ -14,6 +14,27 @@ let _cachedEncodings = null;       // {mu, factors, factor_names}
 let _cachedReady     = false;
 let _cachedFetchInProgress = false;
 
+// Hover / click panel state
+const _scatterSampleCache = new Map();   // cache_idx → {original, reconstruction, factors, ...}
+let _hoverDebounceTimer  = null;
+let _pinnedCacheIdx      = null;
+const _SHAPE_NAMES = ["square", "ellipse", "heart"];
+
+// Manual HSV-style cyclic colorscale (used when colouring by orientation).
+// Plotly's named "Phase"/"HSV" availability in the browser bundle is patchy,
+// so we ship the stops directly.
+const CYCLIC_COLORSCALE = [
+  [0.000, 'hsl(  0,80%,55%)'],
+  [0.125, 'hsl( 45,80%,55%)'],
+  [0.250, 'hsl( 90,80%,55%)'],
+  [0.375, 'hsl(135,80%,55%)'],
+  [0.500, 'hsl(180,80%,55%)'],
+  [0.625, 'hsl(225,80%,55%)'],
+  [0.750, 'hsl(270,80%,55%)'],
+  [0.875, 'hsl(315,80%,55%)'],
+  [1.000, 'hsl(360,80%,55%)'],
+];
+
 function gaussianPDF(x, mu, sigma) {
   const z = (x - mu) / sigma;
   return Math.exp(-0.5 * z * z) / (sigma * Math.sqrt(2 * Math.PI));
@@ -197,19 +218,34 @@ async function renderGeom2D() {
     ? cache.factors.map(row => row[factorIdx])
     : null;
 
+  // Cyclic colormap when colouring by the cyclic 'orientation' factor —
+  // linear viridis would map orientation=0° and orientation=351° to the
+  // most distant colours, masking the cyclic structure.
+  const useCyclic = (_geom2dColorBy === 'orientation');
+  const colorscale = useCyclic ? CYCLIC_COLORSCALE : 'Viridis';
+
+  const cacheIdx = Array.from({length: xs.length}, (_, i) => i);
+
   // Scatter
   const scatter = {
     type: 'scattergl', mode: 'markers',
     x: xs, y: ys,
+    customdata: cacheIdx,
     marker: {
-      size: 4, opacity: 0.6,
+      size: 5, opacity: 0.7,
       color: colorVals,
-      colorscale: 'Viridis',
+      colorscale,
       showscale: !!colorVals,
-      colorbar: colorVals ? {title: _geom2dColorBy, len: 0.7} : null,
+      colorbar: colorVals ? {
+        title: _geom2dColorBy + (useCyclic ? ' (cyclic)' : ''),
+        len: 0.7,
+      } : null,
     },
     name: 'encoded samples',
-    hoverinfo: 'skip',
+    hovertemplate:
+      `cache#%{customdata} · z${a}=%{x:.2f} · z${b}=%{y:.2f}` +
+      (colorVals ? `<br>${_geom2dColorBy}=%{marker.color}` : '') +
+      '<extra></extra>',
   };
 
   // Prior 95% contour: circle of radius 2.45
@@ -265,6 +301,13 @@ async function renderGeom2D() {
     legend: {orientation: 'h', y: -0.18, font:{size:10}},
   };
   Plotly.newPlot(plotEl, traces, layout, {responsive: true, displayModeBar: false});
+
+  // Hook hover + click for the original/recon side-panel.
+  // Plotly attaches its event API to the <div> after newPlot completes.
+  plotEl.removeAllListeners?.('plotly_hover');
+  plotEl.removeAllListeners?.('plotly_click');
+  plotEl.on('plotly_hover',   onScatterHover);
+  plotEl.on('plotly_click',   onScatterClick);
 }
 
 function refreshGeom2DPosterior() {
@@ -277,11 +320,97 @@ window.refreshGeom2DPosterior = refreshGeom2DPosterior;
 function onGeom2DDimChange() {
   _geom2dDimA = parseInt(document.getElementById('geom-2d-dim-a').value);
   _geom2dDimB = parseInt(document.getElementById('geom-2d-dim-b').value);
+  clearScatterSidePanel();
   renderGeom2D();
 }
 function onGeom2DColorChange() {
   _geom2dColorBy = document.getElementById('geom-2d-color').value;
+  // Colour change keeps the same dots; side-panel reading stays valid.
   renderGeom2D();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Hover / click side-panel (original + reconstruction for cached point)
+// ─────────────────────────────────────────────────────────────────────────
+
+function onScatterHover(evt) {
+  if (_pinnedCacheIdx !== null) return;   // pinned → don't follow cursor
+  const pt = evt.points?.[0]; if (!pt) return;
+  const idx = (typeof pt.customdata === 'number') ? pt.customdata : null;
+  if (idx === null) return;
+  if (_hoverDebounceTimer) clearTimeout(_hoverDebounceTimer);
+  _hoverDebounceTimer = setTimeout(() => {
+    if (_pinnedCacheIdx === null) showCachedSample(idx, false);
+  }, 100);
+}
+
+function onScatterClick(evt) {
+  const pt = evt.points?.[0]; if (!pt) return;
+  const idx = (typeof pt.customdata === 'number') ? pt.customdata : null;
+  if (idx === null) return;
+  // Toggle: clicking the already-pinned point unpins.
+  if (_pinnedCacheIdx === idx) { unpinScatter(); return; }
+  _pinnedCacheIdx = idx;
+  showCachedSample(idx, true);
+}
+
+function unpinScatter() {
+  _pinnedCacheIdx = null;
+  document.getElementById('geom-2d-side').classList.remove('pinned');
+  const btn = document.getElementById('geom-2d-unpin');
+  if (btn) btn.style.display = 'none';
+}
+
+async function fetchCachedSample(cacheIdx) {
+  if (_scatterSampleCache.has(cacheIdx)) return _scatterSampleCache.get(cacheIdx);
+  try {
+    const r = await fetch(`/api/cached_sample/${cacheIdx}`);
+    const d = await r.json();
+    if (!r.ok) return null;
+    _scatterSampleCache.set(cacheIdx, d);
+    return d;
+  } catch (e) { return null; }
+}
+
+async function showCachedSample(cacheIdx, pinned) {
+  const data = await fetchCachedSample(cacheIdx);
+  if (!data) return;
+  // Race guard: if another hover replaced the request mid-flight, skip.
+  if (!pinned && _pinnedCacheIdx !== null) return;
+
+  document.getElementById('geom-2d-side-empty').style.display = 'none';
+  document.getElementById('geom-2d-side-content').style.display = '';
+  document.getElementById('geom-2d-orig').src  = data.original;
+  document.getElementById('geom-2d-recon').src = data.reconstruction;
+
+  const f = data.factors;
+  const RQ = ['scale', 'orientation'];
+  const lines = [
+    `<div class="small-mono text-muted">cache#${data.cache_idx} · img#${data.dataset_idx}</div>`,
+    `<div><span class="factor-name">shape:</span> ${f.shape} (${_SHAPE_NAMES[f.shape]})</div>`,
+    `<div class="${RQ.includes('scale') ? 'factor-rq' : ''}"><span class="factor-name">scale:</span> ${f.scale}</div>`,
+    `<div class="${RQ.includes('orientation') ? 'factor-rq' : ''}"><span class="factor-name">orient:</span> ${f.orientation} (${Math.round(f.orientation*9)}°)</div>`,
+    `<div><span class="factor-name">pos:</span> (${f.pos_x}, ${f.pos_y})</div>`,
+  ];
+  document.getElementById('geom-2d-factors').innerHTML = lines.join('');
+
+  const side = document.getElementById('geom-2d-side');
+  const btn  = document.getElementById('geom-2d-unpin');
+  if (pinned) {
+    side.classList.add('pinned');
+    if (btn) btn.style.display = '';
+  } else {
+    side.classList.remove('pinned');
+    if (btn) btn.style.display = 'none';
+  }
+}
+
+// Invalidate side-panel when dim selection changes (the displayed point's
+// position will no longer match the new projection — confusing if left up).
+function clearScatterSidePanel() {
+  unpinScatter();
+  document.getElementById('geom-2d-side-empty').style.display = '';
+  document.getElementById('geom-2d-side-content').style.display = 'none';
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────
@@ -308,6 +437,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     document.getElementById('btn-load-2d').addEventListener('click', renderGeom2D);
   }
+
+  // Unpin button on the side-panel
+  const unpinBtn = document.getElementById('geom-2d-unpin');
+  if (unpinBtn) unpinBtn.addEventListener('click', unpinScatter);
+
+  // Clear side-panel when a new model is loaded (cache_idx semantics change).
+  // Hook into the existing invalidator so we don't have to touch core.js.
+  const origInv = window.invalidateCachedEncodings;
+  window.invalidateCachedEncodings = function () {
+    _scatterSampleCache.clear();
+    clearScatterSidePanel();
+    if (origInv) origInv();
+  };
 
   // When the model loads, the dim list and 1D plot need to refresh too —
   // expose hooks so explorer-core.js can call them.

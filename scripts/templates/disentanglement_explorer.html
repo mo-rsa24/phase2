@@ -19,10 +19,15 @@
 <script>
 window.HELP = {{ help_json|safe }};
 window.__BOOT__ = {
-  modelLoaded: {{ 'true' if loaded_ckpt else 'false' }},
-  latentDim:   {{ loaded_latent_dim or 0 }},
-  beta:        {{ loaded_beta if loaded_beta is not none else 'null' }},
-  ckpt:        {{ loaded_ckpt|tojson }},
+  modelLoaded:    {{ 'true' if loaded_ckpt else 'false' }},
+  latentDim:      {{ loaded_latent_dim or 0 }},
+  beta:           {{ loaded_beta  if loaded_beta  is not none else 'null' }},
+  gamma:          {{ loaded_gamma if loaded_gamma is not none else 'null' }},
+  split:          {{ loaded_split|tojson }},
+  corrFactorA:    {{ loaded_corr_a|tojson }},
+  corrFactorB:    {{ loaded_corr_b|tojson }},
+  corrDirection:  {{ loaded_corr_direction|tojson }},
+  ckpt:           {{ loaded_ckpt|tojson }},
 };
 </script>
 
@@ -42,6 +47,24 @@ window.__BOOT__ = {
 </nav>
 
 <div class="container-fluid py-3 px-4">
+
+<!-- ── Provenance bar (split, hyperparameters, seed) ─────────────────────── -->
+<div id="provenance-bar" class="prov-bar">
+  <span class="prov-label">checkpoint</span>
+  <span class="prov-value font-monospace" id="prov-ckpt">—</span>
+  <span class="prov-divider">|</span>
+  <span class="prov-label">split</span>
+  <span class="prov-value" id="prov-split">—</span>
+  <span class="prov-divider">|</span>
+  <span class="prov-label">model</span>
+  <span class="prov-value" id="prov-model">—</span>
+  <span class="prov-divider">|</span>
+  <span class="prov-label">hyperparameters</span>
+  <span class="prov-value" id="prov-hp">—</span>
+  <span class="prov-divider">|</span>
+  <span class="prov-label">seed</span>
+  <span class="prov-value" id="prov-seed">—</span>
+</div>
 
 <!-- ── Model & Objective collapsible strip ───────────────────────────────── -->
 <details id="objective-strip">
@@ -76,6 +99,7 @@ window.__BOOT__ = {
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-explore">Explore</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-grid">Traversal Grid</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-analysis">Analysis</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-compare">Compare</button></li>
 </ul>
 
 <div class="tab-content">
@@ -89,23 +113,83 @@ window.__BOOT__ = {
     <div class="col-lg-8">
       <div class="panel h-100">
         <h6 class="fw-semibold mb-3">Sweep Experiments</h6>
-        <div class="row g-2" id="exp-cards">
-          {% for exp in experiments %}
-          <div class="col-md-6">
-            <div class="card exp-card p-3" id="exp-card-{{ exp.id }}"
-                 onclick="loadPreset('{{ exp.checkpoint }}', {{ exp.id }})">
-              <div class="d-flex justify-content-between align-items-start">
-                <div>
-                  <div class="fw-semibold">{{ exp.label }}</div>
-                  <div class="text-muted small">{{ exp.purpose }}</div>
-                </div>
-                <span class="badge bg-secondary small-mono">seed={{ exp.seed }}</span>
-              </div>
-              <div class="mt-2 small-mono text-muted">{{ exp.checkpoint }}</div>
-            </div>
+        {# ─── Group cards by split for visual clarity ─────────────────── #}
+        {% set splits = experiments | map(attribute='split') | list %}
+        {% set unique_splits = [] %}
+        {% for s in splits %}{% if s not in unique_splits %}{{ unique_splits.append(s) or '' }}{% endif %}{% endfor %}
+
+        {% for split in unique_splits %}
+        <div class="exp-group">
+          <div class="exp-group-header">
+            {% if split == 'iid' %}
+              <span class="exp-group-title">IID baseline</span>
+              <span class="exp-group-sub">Random 70/15/15 split — control condition</span>
+            {% elif split == 'correlated' %}
+              <span class="exp-group-title">Correlated split</span>
+              <span class="exp-group-sub">
+                {%- for exp in experiments if exp.split == 'correlated' -%}
+                  {%- if loop.first -%}
+                    train data injects {{ exp.corr_direction }} correlation between
+                    <b>{{ exp.corr_factor_a }}</b> and <b>{{ exp.corr_factor_b }}</b>
+                  {%- endif -%}
+                {%- endfor -%}
+              </span>
+            {% elif split == 'heldout' %}
+              <span class="exp-group-title">Held-out pair split</span>
+              <span class="exp-group-sub">compositional generalisation test</span>
+            {% else %}
+              <span class="exp-group-title">{{ split }}</span>
+            {% endif %}
           </div>
-          {% endfor %}
+          <div class="row g-2 exp-group-cards">
+            {% for exp in experiments if exp.split == split %}
+            <div class="col-md-6">
+              <div class="card exp-card p-3" id="exp-card-{{ exp.id }}"
+                   onclick="onExpCardClick(event, '{{ exp.checkpoint }}', {{ exp.id }})">
+                <div class="d-flex justify-content-between align-items-start">
+                  <div>
+                    <div class="fw-semibold">{{ exp.label }}</div>
+                    <div class="text-muted small">{{ exp.purpose }}</div>
+                  </div>
+                  {% set seeds = seeds_by_exp.get(exp.id, []) %}
+                  {% if seeds|length > 1 %}
+                  <div class="dropdown">
+                    <button class="btn btn-secondary btn-sm dropdown-toggle small-mono py-0 px-2"
+                            type="button" id="seed-dd-{{ exp.id }}"
+                            data-bs-toggle="dropdown" aria-expanded="false">
+                      seed={{ exp.seed }}
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="seed-dd-{{ exp.id }}">
+                      {% for s in seeds %}
+                      <li>
+                        <a class="dropdown-item small-mono" href="#"
+                           onclick="loadSeed({{ exp.id }}, {{ s.seed }}, '{{ s.checkpoint }}'); return false;">
+                          seed={{ s.seed }}
+                        </a>
+                      </li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                  {% else %}
+                  <span class="badge bg-secondary small-mono">seed={{ exp.seed }}</span>
+                  {% endif %}
+                </div>
+                {% if exp.split == 'correlated' %}
+                <div class="mt-1">
+                  <span class="badge exp-badge-corr small-mono">corr({{ exp.corr_factor_a }}, {{ exp.corr_factor_b }}, {{ exp.corr_direction }})</span>
+                </div>
+                {% elif exp.split == 'heldout' %}
+                <div class="mt-1">
+                  <span class="badge exp-badge-heldout small-mono">heldout</span>
+                </div>
+                {% endif %}
+                <div class="mt-2 small-mono text-muted">{{ exp.checkpoint }}</div>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
         </div>
+        {% endfor %}
       </div>
     </div>
 
@@ -276,8 +360,9 @@ window.__BOOT__ = {
         </h6>
         <div class="text-muted small mb-2">
           3000 cached encodings projected onto two dims, coloured by a
-          ground-truth factor. Independent dims show orthogonal gradients
-          for two different factors.
+          ground-truth factor. Independent dims show orthogonal gradients.
+          <b>Hover</b> any point to see its original + reconstruction;
+          <b>click</b> to pin.
         </div>
         <div class="geom-controls">
           <label>dim x:</label>
@@ -287,15 +372,43 @@ window.__BOOT__ = {
           <label>colour:</label>
           <select id="geom-2d-color" class="form-select form-select-sm" style="width:auto">
             <option value="scale" selected>scale</option>
-            <option value="orientation">orientation</option>
+            <option value="orientation">orientation (cyclic)</option>
             <option value="shape">shape</option>
             <option value="pos_x">pos_x</option>
             <option value="pos_y">pos_y</option>
           </select>
           <button class="btn btn-primary btn-sm" id="btn-load-2d">Render</button>
         </div>
-        <div id="geom-2d-plot" style="min-height:380px;">
-          <div class="text-muted small p-3">Click <em>Render</em> to load (lazy: ~240 KB).</div>
+        <div class="geom-2d-row">
+          <div class="geom-2d-plot-wrap">
+            <div id="geom-2d-plot" style="min-height:380px;">
+              <div class="text-muted small p-3">Click <em>Render</em> to load (lazy: ~240 KB).</div>
+            </div>
+          </div>
+          <div class="geom-2d-side" id="geom-2d-side">
+            <div id="geom-2d-side-empty" class="text-muted small">
+              Hover or click a point on the scatter to see its original
+              dSprites image, the model's reconstruction, and the
+              ground-truth factors.
+            </div>
+            <div id="geom-2d-side-content" style="display:none">
+              <div class="d-flex justify-content-between align-items-center mb-1">
+                <div class="small fw-semibold">Sample preview</div>
+                <button class="btn btn-sm btn-outline-secondary py-0 px-2"
+                        id="geom-2d-unpin" style="display:none"
+                        title="Unpin and resume hover">unpin</button>
+              </div>
+              <div class="small text-muted mb-1 text-center">Original</div>
+              <div class="img-box geom-thumb">
+                <img id="geom-2d-orig" src="" alt="">
+              </div>
+              <div class="small text-muted mt-2 mb-1 text-center">Reconstruction</div>
+              <div class="img-box geom-thumb">
+                <img id="geom-2d-recon" src="" alt="">
+              </div>
+              <div class="small mt-2" id="geom-2d-factors"></div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -500,7 +613,146 @@ window.__BOOT__ = {
       </div>
     </div>
   </div>
+
+  <!-- DCI panel -->
+  <div class="row g-3 mt-1">
+    <div class="col-12">
+      <div class="panel" id="dci-panel">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div>
+            <h6 class="fw-semibold mb-0">
+              DCI &mdash; Disentanglement / Completeness / Informativeness
+              <span class="help-icon" data-help-slug="dci">?</span>
+            </h6>
+            <div class="text-muted small">
+              Eastwood &amp; Williams 2018. Random-Forest importance matrix
+              <i>R</i>(latent &times; factor) drives three scores. Click a
+              heatmap cell to see that dim's traversal; click a factor's
+              row to see its conditional &mu; histogram.
+            </div>
+          </div>
+          <button class="btn btn-outline-primary btn-sm" id="btn-dci">Compute DCI</button>
+        </div>
+        <div id="dci-spinner" style="display:none" class="py-2 text-muted small">
+          <span class="dot dot-spin me-1"></span>
+          Fitting Random Forests &hellip; ~10&ndash;30 s.
+        </div>
+        <div id="dci-error" class="small text-danger"></div>
+
+        <div id="dci-result" style="display:none">
+          <!-- Headline scores -->
+          <div class="d-flex align-items-baseline gap-4 mt-2 mb-3 flex-wrap">
+            <div>
+              <div class="text-muted small">
+                Overall <span class="term" data-help-slug="dci_d">D</span>
+              </div>
+              <div class="d-flex align-items-baseline gap-2">
+                <span class="mig-score" id="dci-d-overall">&mdash;</span>
+                <span id="dci-d-badge"></span>
+              </div>
+            </div>
+            <div>
+              <div class="text-muted small">
+                Overall <span class="term" data-help-slug="dci_c">C</span>
+              </div>
+              <div class="d-flex align-items-baseline gap-2">
+                <span class="mig-score" id="dci-c-overall">&mdash;</span>
+                <span id="dci-c-badge"></span>
+              </div>
+            </div>
+            <div>
+              <div class="text-muted small">
+                Overall <span class="term" data-help-slug="dci_i">I</span>
+              </div>
+              <div class="d-flex align-items-baseline gap-2">
+                <span class="mig-score" id="dci-i-overall">&mdash;</span>
+                <span id="dci-i-badge"></span>
+              </div>
+            </div>
+            <div class="small text-muted ms-auto" style="max-width:380px">
+              D &amp; C should both be high for axis-aligned codes;
+              I tells you whether the factor is encoded at all.
+              Thresholds match MIG: green &ge; 0.4, amber 0.2&ndash;0.4, red &lt; 0.2.
+            </div>
+          </div>
+
+          <!-- Importance heatmap (clickable) -->
+          <div class="mb-3">
+            <div class="howto-line">
+              <span class="term" data-help-slug="importance">Importance matrix R</span>
+              &mdash; rows sum to 1 (D); columns sum to 1 (C).
+              Click any cell for a &plusmn;3&sigma; traversal of that dim.
+            </div>
+            <div id="dci-heatmap" class="plot-container"></div>
+          </div>
+
+          <!-- Per-latent D bars + per-factor C/I bars -->
+          <div class="row g-3">
+            <div class="col-lg-6">
+              <h6 class="fw-semibold mb-2 small">Per-latent D <span class="kl-badge">(sorted by KL)</span></h6>
+              <div class="row g-2" id="dci-d"></div>
+            </div>
+            <div class="col-lg-3">
+              <h6 class="fw-semibold mb-2 small">Per-factor C</h6>
+              <div class="row g-2" id="dci-c"></div>
+            </div>
+            <div class="col-lg-3">
+              <h6 class="fw-semibold mb-2 small">Per-factor I (R&sup2;)</h6>
+              <div class="row g-2" id="dci-i"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div><!-- /tab-analysis -->
+
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     TAB 5: COMPARE  (Phase 2b)
+     Pin up to 4 checkpoints; render their metrics side-by-side.
+═══════════════════════════════════════════════════════════════════════ -->
+<div class="tab-pane fade" id="tab-compare">
+  <!-- Pinned set -->
+  <div class="panel mb-3">
+    <h6 class="fw-semibold mb-2">Compare set</h6>
+    <div class="text-muted small mb-2">
+      Pin up to 4 checkpoints to compare metrics side-by-side.
+      First-time compute per checkpoint takes ~30–60 s; subsequent
+      pins are cached.
+    </div>
+    <div id="compare-pinned" class="d-flex flex-wrap gap-2 mb-2"></div>
+    <div class="d-flex gap-2 align-items-center flex-wrap">
+      <select id="compare-picker" class="form-select form-select-sm" style="max-width:380px;">
+        <option value="">Choose a sweep checkpoint to pin …</option>
+      </select>
+      <button class="btn btn-primary btn-sm" id="btn-compare-pin">Pin</button>
+      <span class="text-muted small" id="compare-pin-status"></span>
+    </div>
+  </div>
+
+  <!-- Metrics table -->
+  <div class="panel mb-3">
+    <h6 class="fw-semibold mb-2">Metrics summary</h6>
+    <div class="text-muted small mb-2">
+      Active dims (KL > 0.1), |Spearman ρ|<sub>max</sub> per factor,
+      MIG, DCI-D / C / I. ⚠ flags an entanglement signature
+      (scale and orientation share a top dim).
+    </div>
+    <div id="compare-table" class="compare-table-wrap">
+      <div class="text-muted small">Pin a checkpoint to populate.</div>
+    </div>
+  </div>
+
+  <!-- Side-by-side KL spectrums + correlation heatmaps -->
+  <div class="panel">
+    <h6 class="fw-semibold mb-2">Per-checkpoint deep-dive</h6>
+    <div class="text-muted small mb-3">
+      KL spectrum and |Spearman ρ| heatmap per pinned checkpoint.
+    </div>
+    <div id="compare-deepdive" class="row g-3"></div>
+  </div>
+</div><!-- /tab-compare -->
 
 </div><!-- /tab-content -->
 </div><!-- /container -->
@@ -547,6 +799,7 @@ window.__BOOT__ = {
 <script src="{{ url_for('static', filename='js/explorer-core.js') }}"></script>
 <script src="{{ url_for('static', filename='js/explorer-analysis.js') }}"></script>
 <script src="{{ url_for('static', filename='js/explorer-geometric.js') }}"></script>
+<script src="{{ url_for('static', filename='js/explorer-compare.js') }}"></script>
 
 </body>
 </html>

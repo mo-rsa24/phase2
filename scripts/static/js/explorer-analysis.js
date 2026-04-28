@@ -7,6 +7,10 @@
 // Top-level threshold constants (research-domain defaults from plan)
 const MIG_GREEN = 0.4;
 const MIG_AMBER = 0.2;
+// DCI uses the same convention.
+const DCI_GREEN = 0.4;
+const DCI_AMBER = 0.2;
+let _dciPollTimer = null;
 
 // Single-dim traversal cache (keyed by `${dim}|${nSteps}|${range}`)
 const _singleDimCache = new Map();
@@ -139,6 +143,144 @@ function renderMIG(result) {
 
   document.getElementById('mig-result').style.display = '';
 }
+
+// ── DCI ──────────────────────────────────────────────────────────────────
+async function startDCI() {
+  if (!window.modelLoaded) return;
+  document.getElementById('dci-error').textContent = '';
+  document.getElementById('dci-result').style.display = 'none';
+  document.getElementById('dci-spinner').style.display = '';
+  document.getElementById('btn-dci').disabled = true;
+  await fetch('/api/dci/start', {method: 'POST'});
+  _dciPollTimer = setInterval(pollDCI, 2000);
+}
+
+async function pollDCI() {
+  try {
+    const r    = await fetch('/api/dci/status');
+    const data = await r.json();
+    if (data.status === 'done') {
+      clearInterval(_dciPollTimer);
+      document.getElementById('dci-spinner').style.display = 'none';
+      document.getElementById('btn-dci').disabled = false;
+      renderDCI(data.result);
+    } else if (data.status === 'error') {
+      clearInterval(_dciPollTimer);
+      document.getElementById('dci-spinner').style.display = 'none';
+      document.getElementById('btn-dci').disabled = false;
+      document.getElementById('dci-error').textContent = data.error || 'Unknown error';
+    }
+  } catch (e) { /* retry next tick */ }
+}
+
+function dciBadge(v) {
+  if (v >= DCI_GREEN) return '<span class="mig-badge mig-badge-green">strong</span>';
+  if (v >= DCI_AMBER) return '<span class="mig-badge mig-badge-amber">moderate</span>';
+  return '<span class="mig-badge mig-badge-red">poor</span>';
+}
+
+function renderDCI(result) {
+  document.getElementById('dci-d-overall').textContent = result.D.toFixed(3);
+  document.getElementById('dci-c-overall').textContent = result.C.toFixed(3);
+  document.getElementById('dci-i-overall').textContent = result.I.toFixed(3);
+  document.getElementById('dci-d-badge').innerHTML = dciBadge(result.D);
+  document.getElementById('dci-c-badge').innerHTML = dciBadge(result.C);
+  document.getElementById('dci-i-badge').innerHTML = dciBadge(result.I);
+
+  // ----- Heatmap (latent × factor), rows sorted by KL desc -----
+  const ldim = result.D_per_latent.length;
+  const klRef = window.globalKL || new Array(ldim).fill(0);
+  const order = klRef.map((k, i) => ({k, i})).sort((a, b) => b.k - a.k).map(o => o.i);
+  const sortedImp = order.map(i => result.importance[i]);
+  const ylabs = order.map(i => `z${i} (KL=${klRef[i].toFixed(2)})`);
+  const data = [{
+    type: 'heatmap',
+    z: sortedImp,
+    x: result.factor_names,
+    y: ylabs,
+    colorscale: 'Blues',
+    zmin: 0,
+    zmax: Math.max(0.01, Math.max(...sortedImp.flat())),
+    text: sortedImp.map(row => row.map(v => v.toFixed(2))),
+    texttemplate: '%{text}',
+    showscale: true,
+  }];
+  const layout = {
+    title: {text: 'Importance R(latent × factor)', font:{size:13}},
+    xaxis: {title: 'Ground-truth factor', side: 'bottom'},
+    yaxis: {title: 'Latent dim (↑ KL)', autorange: 'reversed'},
+    margin: {t: 50, b: 60, l: 130, r: 20},
+    height: Math.max(320, ldim * 28 + 120),
+  };
+  Plotly.newPlot('dci-heatmap', data, layout, {responsive: true, displayModeBar: false});
+
+  // Click → reuse the existing single-dim traversal modal.
+  const heatmapEl = document.getElementById('dci-heatmap');
+  heatmapEl.removeAllListeners?.('plotly_click');
+  heatmapEl.on('plotly_click', evt => onHeatmapClick(evt));
+
+  // ----- Per-latent D bars (in KL order) -----
+  const dContainer = document.getElementById('dci-d');
+  dContainer.innerHTML = order.map(i => {
+    const v   = result.D_per_latent[i];
+    const pct = Math.round(v * 100);
+    return `<div class="col-md-6">
+      <div class="mig-row">
+        <div class="d-flex align-items-center justify-content-between">
+          <span class="small text-muted">z${i}</span>
+          ${dciBadge(v)}
+        </div>
+        <div class="mig-bar"><div class="mig-fill" style="width:${Math.min(pct,100)}%"></div></div>
+        <div class="small fw-semibold">${v.toFixed(3)}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // ----- Per-factor C bars (RQ rows pinned to front, highlighted) -----
+  const RQ = ['scale', 'orientation'];
+  const reorderFactors = (vals) => {
+    const all = result.factor_names.map((n, k) => [n, vals[k]]);
+    const pinned = RQ.map(k => all.find(([n]) => n === k)).filter(Boolean);
+    const rest   = all.filter(([n]) => !RQ.includes(n));
+    return [...pinned, ...rest];
+  };
+
+  const cContainer = document.getElementById('dci-c');
+  cContainer.innerHTML = reorderFactors(result.C_per_factor).map(([name, v]) => {
+    const pct = Math.round(v * 100);
+    const isRQ = RQ.includes(name);
+    return `<div class="col-12">
+      <div class="mig-row ${isRQ ? 'mig-row-hl' : ''}">
+        <div class="d-flex align-items-center justify-content-between">
+          <span class="small text-muted">${name}${isRQ ? ' <small>(RQ)</small>' : ''}</span>
+          ${dciBadge(v)}
+        </div>
+        <div class="mig-bar"><div class="mig-fill" style="width:${Math.min(pct,100)}%"></div></div>
+        <div class="small fw-semibold">${v.toFixed(3)}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // ----- Per-factor I bars (R²) -----
+  const iContainer = document.getElementById('dci-i');
+  iContainer.innerHTML = reorderFactors(result.I_per_factor).map(([name, v]) => {
+    const pct = Math.round(v * 100);
+    const isRQ = RQ.includes(name);
+    return `<div class="col-12">
+      <div class="mig-row ${isRQ ? 'mig-row-hl' : ''}">
+        <div class="d-flex align-items-center justify-content-between">
+          <span class="small text-muted">${name}${isRQ ? ' <small>(RQ)</small>' : ''}</span>
+          ${dciBadge(v)}
+        </div>
+        <div class="mig-bar"><div class="mig-fill" style="width:${Math.min(pct,100)}%"></div></div>
+        <div class="small fw-semibold">${v.toFixed(3)}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('dci-result').style.display = '';
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // PHASE 3 — qualitative interactions
@@ -305,4 +447,6 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-kl').addEventListener('click',   computeKL);
   document.getElementById('btn-corr').addEventListener('click', computeCorr);
   document.getElementById('btn-mig').addEventListener('click',  startMIG);
+  const dciBtn = document.getElementById('btn-dci');
+  if (dciBtn) dciBtn.addEventListener('click', startDCI);
 });

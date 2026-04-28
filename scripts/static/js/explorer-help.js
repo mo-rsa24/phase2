@@ -129,9 +129,63 @@ function renderObjectiveStrip() {
   });
 }
 
-function updateObjectiveStrip(beta, ckpt) {
+// ── Provenance bar ───────────────────────────────────────────────────────
+function _splitDescription(split, a, b, dir) {
+  if (split === 'iid')        return ['IID (random 70/15/15)', 'split-iid'];
+  if (split === 'correlated') return [`correlated(${a}, ${b}, ${dir})`, 'split-correlated'];
+  if (split === 'heldout')    return ['heldout pair', 'split-heldout'];
+  return ['unknown', 'split-unknown'];
+}
+
+function updateProvenanceBar(info) {
+  // info: {ckpt, split, corrA, corrB, corrDir, beta, gamma, latentDim, seed, model}
+  const ckptEl  = document.getElementById('prov-ckpt');
+  const splitEl = document.getElementById('prov-split');
+  const modelEl = document.getElementById('prov-model');
+  const hpEl    = document.getElementById('prov-hp');
+  const seedEl  = document.getElementById('prov-seed');
+  if (!ckptEl) return;
+
+  ckptEl.textContent = info.ckpt || '—';
+
+  const [splitText, splitClass] = _splitDescription(
+    info.split, info.corrA, info.corrB, info.corrDir);
+  splitEl.textContent = splitText;
+  splitEl.className   = `prov-value ${splitClass}`;
+
+  modelEl.textContent = info.model || '—';
+
+  // Hyperparameter summary string
+  const parts = [];
+  if (info.latentDim) parts.push(`z=${info.latentDim}`);
+  if (info.beta  !== null && info.beta  !== undefined) parts.push(`β=${info.beta}`);
+  if (info.gamma !== null && info.gamma !== undefined) parts.push(`γ=${info.gamma}`);
+  hpEl.textContent = parts.length ? parts.join(', ') : '—';
+
+  // Seed: pulled from ckpt path if present (heuristic — no harm if missing).
+  let seed = info.seed;
+  if (!seed && info.ckpt) {
+    const m = info.ckpt.match(/_seed(\d+)/);
+    if (m) seed = m[1];
+  }
+  seedEl.textContent = seed || '—';
+}
+window.updateProvenanceBar = updateProvenanceBar;
+
+function _detectModel(ckpt) {
+  if (!ckpt) return null;
+  if (ckpt.includes('factorvae') || ckpt.includes('factor_vae')) return 'FactorVAE';
+  return 'VAE';
+}
+
+function updateObjectiveStrip(beta, ckpt, gamma) {
   const betaEl = document.getElementById('objective-beta');
-  if (betaEl) betaEl.textContent = (beta !== null && beta !== undefined) ? `β = ${beta}` : 'β = ?';
+  if (betaEl) {
+    const parts = [];
+    if (beta  !== null && beta  !== undefined) parts.push(`β = ${beta}`);
+    if (gamma !== null && gamma !== undefined) parts.push(`γ = ${gamma}`);
+    betaEl.textContent = parts.length ? parts.join(' · ') : 'β = ?';
+  }
   const ckptEl = document.getElementById('objective-ckpt');
   if (ckptEl) ckptEl.textContent = ckpt || '';
 }
@@ -153,8 +207,26 @@ document.addEventListener('DOMContentLoaded', () => {
   initHelpIcons();
   renderObjectiveStrip();
   renderInlineFormulas();
-  if (window.__BOOT__?.beta !== undefined) {
-    updateObjectiveStrip(window.__BOOT__.beta, window.__BOOT__.ckpt);
+  if (window.__BOOT__?.beta !== undefined || window.__BOOT__?.gamma !== undefined) {
+    updateObjectiveStrip(
+      window.__BOOT__.beta,
+      window.__BOOT__.ckpt,
+      window.__BOOT__.gamma,
+    );
+  }
+
+  if (window.__BOOT__) {
+    updateProvenanceBar({
+      ckpt:      window.__BOOT__.ckpt,
+      split:     window.__BOOT__.split,
+      corrA:     window.__BOOT__.corrFactorA,
+      corrB:     window.__BOOT__.corrFactorB,
+      corrDir:   window.__BOOT__.corrDirection,
+      beta:      window.__BOOT__.beta,
+      gamma:     window.__BOOT__.gamma,
+      latentDim: window.__BOOT__.latentDim,
+      model:     _detectModel(window.__BOOT__.ckpt),
+    });
   }
 
   const toggle = document.getElementById('help-mode-toggle');

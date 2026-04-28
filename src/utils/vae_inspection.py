@@ -57,9 +57,17 @@ def find_sample_index(
     return int(lookup[factor_tuple])
 
 
+def _strip_compile_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    # torch.compile wraps the module so saved keys are prefixed with "_orig_mod.".
+    prefix = "_orig_mod."
+    if all(k.startswith(prefix) for k in state):
+        return {k[len(prefix):]: v for k, v in state.items()}
+    return state
+
+
 def _extract_state_dict(payload: Any, module_name: str) -> dict[str, torch.Tensor]:
     if isinstance(payload, dict) and payload and all(isinstance(v, torch.Tensor) for v in payload.values()):
-        return payload
+        return _strip_compile_prefix(payload)
 
     if not isinstance(payload, dict):
         raise TypeError(f"Unsupported checkpoint payload type for {module_name}: {type(payload)!r}")
@@ -74,12 +82,13 @@ def _extract_state_dict(payload: Any, module_name: str) -> dict[str, torch.Tenso
     for key in (f"{module_name}_state_dict", f"{module_name}_dict"):
         value = payload.get(key)
         if _is_tensor_dict(value):
-            return value
+            return _strip_compile_prefix(value)
 
     # Generic keys may need prefix extraction to isolate this module's weights.
     for key in (module_name, "state_dict", "model_state_dict", "model"):
         value = payload.get(key)
         if _is_tensor_dict(value):
+            value = _strip_compile_prefix(value)
             prefix = f"{module_name}."
             if any(k.startswith(prefix) for k in value):
                 return {k[len(prefix):]: v for k, v in value.items() if k.startswith(prefix)}
@@ -88,7 +97,7 @@ def _extract_state_dict(payload: Any, module_name: str) -> dict[str, torch.Tenso
     prefix = f"{module_name}."
     prefixed = {k[len(prefix):]: v for k, v in payload.items() if k.startswith(prefix)}
     if prefixed:
-        return prefixed
+        return _strip_compile_prefix(prefixed)
 
     raise KeyError(
         f"Could not find a state dict for '{module_name}' in checkpoint payload. "
