@@ -6,6 +6,9 @@
 // ── Global state ─────────────────────────────────────────────────────────
 window.modelLoaded   = window.__BOOT__?.modelLoaded ?? false;
 window.latentDim     = window.__BOOT__?.latentDim   ?? 0;
+window.supervised    = window.__BOOT__?.supervised  ?? false;
+window.zScaleIdx     = window.__BOOT__?.zScaleIdx   ?? 0;
+window.zOrientIdx    = window.__BOOT__?.zOrientIdx  ?? [1, 2];
 window.anchorMu      = null;
 window.anchorLogvar  = null;
 window.anchorRecon   = null;
@@ -16,6 +19,18 @@ window.globalKL      = null;     // (latent_dim,) from /api/kl_spectrum
 window.migPollTimer  = null;
 
 const SHAPE_NAMES = ["square", "ellipse", "heart"];
+
+// Semantic label for a latent dim. For supervised runs, z[Z_SCALE_IDX] is
+// regressed to scale and z[Z_ORIENT_IDX] to (sin(kθ), cos(kθ)) on the unit
+// circle — surface those names everywhere we'd otherwise show a bare "z3".
+window.dimLabel = function (i) {
+  if (!window.supervised) return `z${i}`;
+  if (i === window.zScaleIdx) return `z${i} (scale)`;
+  const [iSin, iCos] = window.zOrientIdx || [];
+  if (i === iSin) return `z${i} (orient sin)`;
+  if (i === iCos) return `z${i} (orient cos)`;
+  return `z${i}`;
+};
 
 // ── Tiny helpers ─────────────────────────────────────────────────────────
 function debounce(fn, ms) {
@@ -79,6 +94,9 @@ async function doLoad(checkpoint) {
 
     window.modelLoaded = true;
     window.latentDim   = data.latent_dim;
+    window.supervised  = !!data.supervised;
+    if (typeof data.z_scale_idx === 'number') window.zScaleIdx = data.z_scale_idx;
+    if (Array.isArray(data.z_orient_idx))     window.zOrientIdx = data.z_orient_idx;
     document.getElementById('load-info').innerHTML =
       `<div class="text-success">&#10003; Loaded: <span class="font-monospace">${data.checkpoint}</span></div>
        <div>latent_dim = ${window.latentDim}</div>`;
@@ -106,6 +124,11 @@ async function doLoad(checkpoint) {
     }
 
     buildLatentSliders();
+
+    // Repopulate the geometric dim selectors with the new latent_dim and pick
+    // up semantic labels / orient-ring visibility for the freshly loaded run.
+    if (typeof window.refreshGeom1DDimList === 'function') window.refreshGeom1DDimList();
+    if (typeof window.refreshGeom2DDimList === 'function') window.refreshGeom2DDimList();
 
     // Reset anchor state
     window.anchorMu = window.anchorLogvar = window.anchorRecon =
@@ -291,8 +314,9 @@ function renderMuBars(mu, logvar, klDims) {
 
     const row = document.createElement('div');
     row.className = 'mu-row';
+    const muLbl = window.dimLabel ? window.dimLabel(i) : `z${i}`;
     row.innerHTML = `
-      <span class="mu-label">z${i}</span>
+      <span class="mu-label">${muLbl}</span>
       <canvas class="mu-spark" width="60" height="18"></canvas>
       <div class="mu-bar-wrap">
         <div class="mu-bar-fill" style="left:${fillL}%; width:${pct}%; background:${barColor};"></div>
@@ -355,8 +379,9 @@ function buildLatentRow(dimIdx, value, anchorVal, kl) {
   const row = document.createElement('div');
   row.className = 'slider-row';
   const klBadge = kl ? `<span class="kl-badge">KL=${kl.toFixed(2)}</span>` : '';
+  const label = window.dimLabel ? window.dimLabel(dimIdx) : `z${dimIdx}`;
   row.innerHTML = `
-    <span class="slider-lbl" id="lbl-z${dimIdx}">z${dimIdx} ${klBadge}</span>
+    <span class="slider-lbl" id="lbl-z${dimIdx}">${label} ${klBadge}</span>
     <button class="btn-reset-z" data-dim="${dimIdx}" title="Reset z${dimIdx} to anchor μ"
             ${anchorVal === null ? 'disabled' : ''}>↺</button>
     <input type="range" id="z-slider-${dimIdx}" min="-4" max="4" step="0.05" value="${value.toFixed(3)}"

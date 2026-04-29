@@ -64,8 +64,9 @@ function refreshGeom1DDimList() {
   const order = kls.map((k, i) => ({k, i})).sort((a, b) => b.k - a.k);
 
   const prevSel = sel.value;
+  const lbl = (i) => (window.dimLabel ? window.dimLabel(i) : `z${i}`);
   sel.innerHTML = order.map(({k, i}) =>
-    `<option value="${i}">z${i} (KL=${k.toFixed(2)})</option>`).join('');
+    `<option value="${i}">${lbl(i)} (KL=${k.toFixed(2)})</option>`).join('');
 
   // Default to top-KL dim if no previous selection
   if (prevSel === '' || prevSel === '—' || prevSel === null) {
@@ -111,8 +112,9 @@ function refreshGeom1D() {
     {x: xs, y: postY,  type: 'scatter', mode: 'lines', name: `posterior 𝒩(μ, σ²)`,
      line: {color: '#1d4ed8', width: 2},   fill: 'tozeroy', fillcolor: 'rgba(29,78,216,0.18)'},
   ];
+  const lbl1d = window.dimLabel ? window.dimLabel(i) : `z${i}`;
   const layout = {
-    title:  {text: `z${i}: μ=${mu.toFixed(2)}, σ=${sigma.toFixed(2)}, KL=${klVal.toFixed(2)} nats`, font:{size:12}},
+    title:  {text: `${lbl1d}: μ=${mu.toFixed(2)}, σ=${sigma.toFixed(2)}, KL=${klVal.toFixed(2)} nats`, font:{size:12}},
     xaxis:  {title: `z${i}`, range: [xMin, xMax]},
     yaxis:  {title: 'density', rangemode: 'tozero'},
     margin: {t: 40, b: 40, l: 50, r: 16},
@@ -178,11 +180,12 @@ async function ensureCachedEncodings() {
 
 function refreshGeom2DDimList() {
   const ld = window.latentDim || 0;
+  const lbl = (i) => (window.dimLabel ? window.dimLabel(i) : `z${i}`);
   ['geom-2d-dim-a', 'geom-2d-dim-b'].forEach(id => {
     const sel = document.getElementById(id);
     if (!sel) return;
     sel.innerHTML = Array.from({length: ld}, (_, i) =>
-      `<option value="${i}">z${i}</option>`).join('');
+      `<option value="${i}">${lbl(i)}</option>`).join('');
   });
   // Defaults: top-2 KL dims (distinct)
   let order = [0, 1];
@@ -194,6 +197,17 @@ function refreshGeom2DDimList() {
     document.getElementById('geom-2d-dim-b').value = String(order[1]);
     _geom2dDimA = order[0];
     _geom2dDimB = order[1];
+  }
+  // Show the "Orient ring" preset only for supervised runs where the
+  // (sin, cos) pair literally lives at known dims.
+  const ringBtn = document.getElementById('btn-orient-ring');
+  if (ringBtn) {
+    const ok = window.supervised
+      && Array.isArray(window.zOrientIdx)
+      && window.zOrientIdx.length === 2
+      && window.zOrientIdx[0] < ld
+      && window.zOrientIdx[1] < ld;
+    ringBtn.style.display = ok ? '' : 'none';
   }
 }
 
@@ -292,10 +306,29 @@ async function renderGeom2D() {
     });
   }
 
+  // Unit-circle reference: for supervised runs, z[Z_ORIENT_IDX] regresses to
+  // (sin(kθ), cos(kθ)), so plotting (z_orient_sin vs z_orient_cos) should land
+  // on the unit circle. Drawing it makes the target geometry obvious.
+  const orient = Array.isArray(window.zOrientIdx) ? window.zOrientIdx : null;
+  const onOrientPair = !!orient && (
+    (a === orient[0] && b === orient[1]) || (a === orient[1] && b === orient[0])
+  );
+  if (window.supervised && onOrientPair) {
+    traces.push({
+      type: 'scatter', mode: 'lines',
+      x: theta.map(t => Math.cos(t)),
+      y: theta.map(t => Math.sin(t)),
+      line: {color: '#16a34a', dash: 'dash', width: 1.5},
+      name: 'orient target (unit circle)',
+      hoverinfo: 'skip',
+    });
+  }
+
+  const lbl = (i) => (window.dimLabel ? window.dimLabel(i) : `z${i}`);
   const layout = {
-    title:  {text: `z${a} vs z${b} (colored by ${_geom2dColorBy})`, font:{size:12}},
-    xaxis:  {title: `z${a}`, scaleanchor: 'y', scaleratio: 1, zeroline: true, zerolinecolor:'#cbd5e1'},
-    yaxis:  {title: `z${b}`, zeroline: true, zerolinecolor:'#cbd5e1'},
+    title:  {text: `${lbl(a)} vs ${lbl(b)} (colored by ${_geom2dColorBy})`, font:{size:12}},
+    xaxis:  {title: lbl(a), scaleanchor: 'y', scaleratio: 1, zeroline: true, zerolinecolor:'#cbd5e1'},
+    yaxis:  {title: lbl(b), zeroline: true, zerolinecolor:'#cbd5e1'},
     margin: {t: 40, b: 40, l: 50, r: 16},
     height: 380,
     legend: {orientation: 'h', y: -0.18, font:{size:10}},
@@ -326,6 +359,36 @@ function onGeom2DDimChange() {
 function onGeom2DColorChange() {
   _geom2dColorBy = document.getElementById('geom-2d-color').value;
   // Colour change keeps the same dots; side-panel reading stays valid.
+  renderGeom2D();
+}
+
+// "Orient ring" preset — only meaningful for supervised runs. Sets dim x =
+// z_orient_cos, dim y = z_orient_sin, colour = orientation, then renders.
+// The unit-circle reference is added by renderGeom2D when it detects the
+// orient pair is on screen.
+function applyOrientRingPreset() {
+  const orient = Array.isArray(window.zOrientIdx) ? window.zOrientIdx : null;
+  if (!window.supervised || !orient || orient.length !== 2) return;
+  const [iSin, iCos] = orient;
+  const ld = window.latentDim || 0;
+  if (iSin >= ld || iCos >= ld) return;
+
+  const dimA = document.getElementById('geom-2d-dim-a');
+  const dimB = document.getElementById('geom-2d-dim-b');
+  const col  = document.getElementById('geom-2d-color');
+  if (!dimA || !dimB) return;
+
+  // x = cos, y = sin so the point at θ=0 sits at (1, 0) — matches the
+  // mathematical unit-circle convention readers expect.
+  dimA.value = String(iCos);
+  dimB.value = String(iSin);
+  _geom2dDimA = iCos;
+  _geom2dDimB = iSin;
+  if (col) {
+    col.value = 'orientation';
+    _geom2dColorBy = 'orientation';
+  }
+  clearScatterSidePanel();
   renderGeom2D();
 }
 
@@ -436,6 +499,8 @@ document.addEventListener('DOMContentLoaded', () => {
       _geom2dColorBy = colorBy.value;
     }
     document.getElementById('btn-load-2d').addEventListener('click', renderGeom2D);
+    const ringBtn = document.getElementById('btn-orient-ring');
+    if (ringBtn) ringBtn.addEventListener('click', applyOrientRingPreset);
   }
 
   // Unpin button on the side-panel

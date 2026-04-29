@@ -28,6 +28,9 @@ window.__BOOT__ = {
   corrFactorB:    {{ loaded_corr_b|tojson }},
   corrDirection:  {{ loaded_corr_direction|tojson }},
   ckpt:           {{ loaded_ckpt|tojson }},
+  supervised:     {{ 'true' if loaded_supervised else 'false' }},
+  zScaleIdx:      {{ z_scale_idx }},
+  zOrientIdx:     {{ z_orient_idx|tojson }},
 };
 </script>
 
@@ -113,36 +116,43 @@ window.__BOOT__ = {
     <div class="col-lg-8">
       <div class="panel h-100">
         <h6 class="fw-semibold mb-3">Sweep Experiments</h6>
-        {# ─── Group cards by split for visual clarity ─────────────────── #}
-        {% set splits = experiments | map(attribute='split') | list %}
-        {% set unique_splits = [] %}
-        {% for s in splits %}{% if s not in unique_splits %}{{ unique_splits.append(s) or '' }}{% endif %}{% endfor %}
+        {# ─── Group cards by `group` (split, or "supervised" for targeted runs) ─ #}
+        {% set group_keys = experiments | map(attribute='group') | list %}
+        {% set unique_groups = [] %}
+        {% for g in group_keys %}{% if g not in unique_groups %}{{ unique_groups.append(g) or '' }}{% endif %}{% endfor %}
 
-        {% for split in unique_splits %}
+        {% for group in unique_groups %}
         <div class="exp-group">
           <div class="exp-group-header">
-            {% if split == 'iid' %}
+            {% if group == 'iid' %}
               <span class="exp-group-title">IID baseline</span>
               <span class="exp-group-sub">Random 70/15/15 split — control condition</span>
-            {% elif split == 'correlated' %}
+            {% elif group == 'correlated' %}
               <span class="exp-group-title">Correlated split</span>
               <span class="exp-group-sub">
-                {%- for exp in experiments if exp.split == 'correlated' -%}
+                {%- for exp in experiments if exp.group == 'correlated' -%}
                   {%- if loop.first -%}
                     train data injects {{ exp.corr_direction }} correlation between
                     <b>{{ exp.corr_factor_a }}</b> and <b>{{ exp.corr_factor_b }}</b>
                   {%- endif -%}
                 {%- endfor -%}
               </span>
-            {% elif split == 'heldout' %}
+            {% elif group == 'heldout' %}
               <span class="exp-group-title">Held-out pair split</span>
               <span class="exp-group-sub">compositional generalisation test</span>
+            {% elif group == 'supervised' %}
+              <span class="exp-group-title">Supervised (targeted)</span>
+              <span class="exp-group-sub">
+                MSE supervision on <b>z<sub>0</sub> = scale</b> and
+                <b>(z<sub>1</sub>, z<sub>2</sub>) = (sin&#x202F;k&theta;,&nbsp;cos&#x202F;k&theta;)</b>
+                — controlled axis-assignment for downstream conditional diffusion
+              </span>
             {% else %}
-              <span class="exp-group-title">{{ split }}</span>
+              <span class="exp-group-title">{{ group }}</span>
             {% endif %}
           </div>
           <div class="row g-2 exp-group-cards">
-            {% for exp in experiments if exp.split == split %}
+            {% for exp in experiments if exp.group == group %}
             <div class="col-md-6">
               <div class="card exp-card p-3" id="exp-card-{{ exp.id }}"
                    onclick="onExpCardClick(event, '{{ exp.checkpoint }}', {{ exp.id }})">
@@ -181,6 +191,11 @@ window.__BOOT__ = {
                 {% elif exp.split == 'heldout' %}
                 <div class="mt-1">
                   <span class="badge exp-badge-heldout small-mono">heldout</span>
+                </div>
+                {% endif %}
+                {% if exp.supervised %}
+                <div class="mt-1">
+                  <span class="badge bg-info text-dark small-mono">supervised: &lambda;<sub>s</sub>={{ exp.lambda_scale }}, &lambda;<sub>o</sub>={{ exp.lambda_orient }}</span>
                 </div>
                 {% endif %}
                 <div class="mt-2 small-mono text-muted">{{ exp.checkpoint }}</div>
@@ -222,6 +237,7 @@ window.__BOOT__ = {
           <li><strong>Exp 2</strong> — β-VAE (β=4). Does stronger KL pressure improve disentanglement?</li>
           <li><strong>Exp 3</strong> — Undercomplete (z=4). 4 dims for 5 factors — forced bottleneck.</li>
           <li><strong>Exp 4</strong> — Overcomplete (z=20). Posterior collapse risk, redundancy.</li>
+          <li><strong>Exp 11+</strong> — Supervised. Targeted MSE on z<sub>0</sub> (scale) and (z<sub>1</sub>, z<sub>2</sub>) (sin/cos of k&theta;) to pin axis assignment for compositional diffusion.</li>
         </ul>
       </div>
     </div>
@@ -378,6 +394,11 @@ window.__BOOT__ = {
             <option value="pos_y">pos_y</option>
           </select>
           <button class="btn btn-primary btn-sm" id="btn-load-2d">Render</button>
+          <button class="btn btn-outline-primary btn-sm" id="btn-orient-ring"
+                  style="display:none"
+                  title="Set dim x = z_orient_cos, dim y = z_orient_sin, colour = orientation. Supervised runs target the unit circle here.">
+            Orient ring
+          </button>
         </div>
         <div class="geom-2d-row">
           <div class="geom-2d-plot-wrap">

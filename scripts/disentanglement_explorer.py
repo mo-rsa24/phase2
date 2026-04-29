@@ -48,6 +48,7 @@ from src.metrics.disentanglement import (
     factor_latent_correlation,
     kl_per_dim,
 )
+from src.utils.factor_targets import Z_ORIENT_IDX, Z_SCALE_IDX
 from src.utils.vae_inspection import (
     build_factor_index,
     load_encoder_decoder,
@@ -106,7 +107,22 @@ EXPERIMENTS = [
      "corr_direction": "positive",
      "latent_dim": 10, "beta": None, "gamma": 35.0, "seed": 42,
      "checkpoint": "checkpoints/factor_vae/correlated_factorvae_z10_gamma35.0_seed42/best.pt"},
+    # ---- Phase 2f: targeted weak supervision (Exp 11+) -----------------
+    # `group` overrides the split-based card grouping in the template so
+    # supervised runs render under their own header even though the data
+    # split is still iid.
+    {"id": 11, "label": "Exp 11 — sup · z=10, β=1.0", "purpose": "Targeted-supervision VAE",
+     "split": "iid", "group": "supervised",
+     "supervised": True, "lambda_scale": 1.0, "lambda_orient": 1.0,
+     "latent_dim": 10, "beta": 1.0, "seed": 0,
+     "checkpoint": "checkpoints/vae/supervised_vae_z10_beta1.0_seed0/best.pt"},
 ]
+
+
+def _exp_group(exp: dict) -> str:
+    """Card grouping key. Supervised runs cluster under their own group;
+    everything else falls back to the data split."""
+    return exp.get("group") or exp["split"]
 
 
 # ── App state ─────────────────────────────────────────────────────────────────
@@ -124,6 +140,8 @@ _state = {
     "corr_factor_a":   None,
     "corr_factor_b":   None,
     "corr_direction":  None,
+    # Targeted weak supervision (read from checkpoint config when present)
+    "supervised":      False,
     # Cached batch encodings (filled in a background thread after load)
     "enc_mu":       None,  # (N, latent_dim)
     "enc_logvar":   None,  # (N, latent_dim)
@@ -233,6 +251,25 @@ def _seeds_by_exp() -> dict[int, list[dict]]:
     return result
 
 
+def _read_checkpoint_supervised(ckpt_path: str | None) -> bool:
+    """True iff the checkpoint was trained with --supervise-target-factors.
+
+    The flag is stored in the checkpoint's ``config`` payload (see
+    `scripts/train_vae.py`). Missing key → False (older runs predate the flag).
+    Errors are swallowed: an unreadable config should not block model loading.
+    """
+    if not ckpt_path:
+        return False
+    try:
+        payload = torch.load(Path(ckpt_path), map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    cfg = payload.get("config") if isinstance(payload, dict) else None
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("supervise_target_factors", False))
+
+
 def _disent_param_for_checkpoint(ckpt_path: str | None) -> dict:
     """Look up disentanglement hyperparameters + split for a checkpoint path.
 
@@ -278,6 +315,7 @@ if args.checkpoint and Path(args.checkpoint).exists():
         device=args.device,
     )
     _params = _disent_param_for_checkpoint(args.checkpoint)
+    _supervised = _read_checkpoint_supervised(args.checkpoint)
     with _lock:
         _state.update(encoder=enc, decoder=dec,
                       latent_dim=int(enc.latent_dim),
@@ -287,7 +325,8 @@ if args.checkpoint and Path(args.checkpoint).exists():
                       split=_params["split"],
                       corr_factor_a=_params["corr_factor_a"],
                       corr_factor_b=_params["corr_factor_b"],
-                      corr_direction=_params["corr_direction"])
+                      corr_direction=_params["corr_direction"],
+                      supervised=_supervised)
     threading.Thread(target=_cache_encoded_samples, daemon=True).start()
     print(f"Model preloaded: latent_dim={enc.latent_dim}")
 
@@ -296,11 +335,13 @@ if args.checkpoint and Path(args.checkpoint).exists():
 
 @app.route("/")
 def index():
+    # Inject the derived `group` field expected by the template grouping logic.
+    experiments = [{**exp, "group": _exp_group(exp)} for exp in EXPERIMENTS]
     return render_template(
         "disentanglement_explorer.html",
         factor_names=list(FACTOR_NAMES),
         factor_sizes=list(FACTOR_SIZES),
-        experiments=EXPERIMENTS,
+        experiments=experiments,
         seeds_by_exp=_seeds_by_exp(),
         loaded_ckpt=_state["ckpt_path"],
         loaded_latent_dim=_state["latent_dim"],
@@ -310,6 +351,9 @@ def index():
         loaded_corr_a=_state["corr_factor_a"],
         loaded_corr_b=_state["corr_factor_b"],
         loaded_corr_direction=_state["corr_direction"],
+        loaded_supervised=_state["supervised"],
+        z_scale_idx=Z_SCALE_IDX,
+        z_orient_idx=list(Z_ORIENT_IDX),
         help_json=json.dumps(HELP),
     )
 
@@ -331,6 +375,7 @@ def api_load():
         return jsonify({"error": str(e)}), 500
 
     params = _disent_param_for_checkpoint(str(path))
+    supervised = _read_checkpoint_supervised(str(path))
     with _lock:
         _state.update(
             encoder=enc, decoder=dec,
@@ -340,6 +385,7 @@ def api_load():
             corr_factor_a=params["corr_factor_a"],
             corr_factor_b=params["corr_factor_b"],
             corr_direction=params["corr_direction"],
+            supervised=supervised,
             enc_mu=None, enc_logvar=None, enc_factors=None,
             enc_indices=None, kl_arr=None,
             corr_matrix=None, mig_top_dim_per_factor={},
@@ -357,6 +403,9 @@ def api_load():
         "corr_factor_a":  params["corr_factor_a"],
         "corr_factor_b":  params["corr_factor_b"],
         "corr_direction": params["corr_direction"],
+        "supervised":     supervised,
+        "z_scale_idx":    Z_SCALE_IDX,
+        "z_orient_idx":   list(Z_ORIENT_IDX),
     })
 
 

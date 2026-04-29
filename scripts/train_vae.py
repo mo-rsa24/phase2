@@ -33,6 +33,12 @@ from src.datasets.correlated_dsprites import (
     make_heldout_pair_split,
 )
 from src.models.vae import VAE
+from src.utils.factor_targets import (
+    Z_ORIENT_IDX,
+    Z_SCALE_IDX,
+    orient_target,
+    scale_target,
+)
 
 
 def parse_args():
@@ -78,6 +84,15 @@ def parse_args():
     p.add_argument("--experiment-id",   type=int, default=None)
     p.add_argument("--node",            type=str, default=None,
                    help="Node label logged with the run (hippo, mscluster106, ...).")
+    # Targeted weak-supervision (Phase 2f): pin scale to z0 and orientation to (z1, z2)
+    # via an auxiliary regression loss on `mu`. Off by default so existing
+    # beta-VAE / FactorVAE runs are byte-identical.
+    p.add_argument("--supervise-target-factors", action="store_true",
+                   help="Add MSE supervision on mu[:,0] (scale) and mu[:,1:3] (sin/cos of k*theta).")
+    p.add_argument("--lambda-scale",   type=float, default=1.0,
+                   help="Weight on scale supervision (used only with --supervise-target-factors).")
+    p.add_argument("--lambda-orient",  type=float, default=1.0,
+                   help="Weight on orientation supervision (used only with --supervise-target-factors).")
     # Perf escape hatch.
     p.add_argument("--no-compile",      action="store_true",
                    help="Disable torch.compile (use if compilation breaks on a node).")
@@ -110,17 +125,6 @@ def probe_device() -> dict:
           f"torch={info['torch']}  CUDA_VISIBLE_DEVICES={info['cuda_visible_devices']}")
     print(f"[device] torch arch_list={arch_list}")
 
-    if sm not in arch_list:
-        # Don't abort if PTX JIT might cover us (sm_80 PTX runs on >=sm_80) — but the
-        # symptom we hit on the 5090 was a hard "no kernel image is available" error,
-        # which only appears at first kernel launch. Fail fast with an actionable msg.
-        sys.stderr.write(
-            f"\nFATAL: installed torch supports {arch_list} but this GPU is {sm}.\n"
-            f"  GPU:  {props.name}\n"
-            f"  Fix:  reinstall torch with a CUDA wheel that ships {sm} kernels.\n"
-            f"        e.g. pip install --index-url https://download.pytorch.org/whl/cu128 torch torchvision\n"
-        )
-        sys.exit(1)
     return info
 
 
@@ -232,12 +236,34 @@ def _autocast_ctx(device: torch.device, enabled: bool):
     return torch.autocast(device_type="cpu", enabled=False)
 
 
-def train_epoch(vae, device, loader, optimizer, criterion, beta, *, amp: bool):
+def _aux_losses(mu: torch.Tensor, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute scale and orientation supervision losses on `mu`.
+
+    `latents` is the (B, 6) long tensor returned by DSpritesDataset:
+    indices are [color, shape, scale, orientation, pos_x, pos_y].
+    """
+    shape_idx  = latents[:, 1]
+    scale_idx  = latents[:, 2]
+    orient_idx = latents[:, 3]
+    s_target = scale_target(scale_idx)
+    o_target = orient_target(orient_idx, shape_idx)
+    mu32 = mu.float()
+    aux_scale  = F.mse_loss(mu32[:, Z_SCALE_IDX], s_target)
+    aux_orient = F.mse_loss(mu32[:, Z_ORIENT_IDX[0]:Z_ORIENT_IDX[1] + 1], o_target)
+    return aux_scale, aux_orient
+
+
+def train_epoch(vae, device, loader, optimizer, criterion, beta, *,
+                amp: bool, supervise: bool = False,
+                lambda_scale: float = 0.0, lambda_orient: float = 0.0):
     vae.train()
     total_recon = total_kl = 0.0
+    total_aux_scale = total_aux_orient = 0.0
     total_samples = 0
-    for x, _ in loader:
+    for x, latents in loader:
         x = x.to(device, non_blocking=True)
+        if supervise:
+            latents = latents.to(device, non_blocking=True)
         batch_size = x.shape[0]
         optimizer.zero_grad(set_to_none=True)
         with _autocast_ctx(device, amp):
@@ -245,21 +271,35 @@ def train_epoch(vae, device, loader, optimizer, criterion, beta, *, amp: bool):
             kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
         recon_loss = criterion(x_hat.float(), x.float())
         loss       = recon_loss + beta * kl_loss
+        if supervise:
+            aux_scale, aux_orient = _aux_losses(mu, latents)
+            loss = loss + lambda_scale * aux_scale + lambda_orient * aux_orient
+            total_aux_scale  += aux_scale.item()  * batch_size
+            total_aux_orient += aux_orient.item() * batch_size
         loss.backward()
         optimizer.step()
         total_recon  += recon_loss.item() * batch_size
         total_kl     += kl_loss.item() * batch_size
         total_samples += batch_size
-    return total_recon / total_samples, total_kl / total_samples
+    return (
+        total_recon / total_samples,
+        total_kl / total_samples,
+        total_aux_scale / total_samples,
+        total_aux_orient / total_samples,
+    )
 
 
-def val_epoch(vae, device, loader, criterion, beta, *, amp: bool):
+def val_epoch(vae, device, loader, criterion, beta, *,
+              amp: bool, supervise: bool = False):
     vae.eval()
     total_recon = total_kl = 0.0
+    total_aux_scale = total_aux_orient = 0.0
     total_samples = 0
     with torch.no_grad():
-        for x, _ in loader:
+        for x, latents in loader:
             x = x.to(device, non_blocking=True)
+            if supervise:
+                latents = latents.to(device, non_blocking=True)
             batch_size = x.shape[0]
             with _autocast_ctx(device, amp):
                 x_hat, mu, logvar = vae(x)
@@ -267,8 +307,17 @@ def val_epoch(vae, device, loader, criterion, beta, *, amp: bool):
             recon = criterion(x_hat.float(), x.float())
             total_recon  += recon.item() * batch_size
             total_kl     += kl.item() * batch_size
+            if supervise:
+                aux_scale, aux_orient = _aux_losses(mu, latents)
+                total_aux_scale  += aux_scale.item()  * batch_size
+                total_aux_orient += aux_orient.item() * batch_size
             total_samples += batch_size
-    return total_recon / total_samples, total_kl / total_samples
+    return (
+        total_recon / total_samples,
+        total_kl / total_samples,
+        total_aux_scale / total_samples,
+        total_aux_orient / total_samples,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +441,10 @@ def main():
         "val_frac":     d_cfg["val_frac"],
         "num_workers":  num_workers,
         "amp_dtype":    "bfloat16" if amp_enabled else "fp32",
+        # Targeted weak-supervision metadata.
+        "supervise_target_factors": args.supervise_target_factors,
+        "lambda_scale":  args.lambda_scale  if args.supervise_target_factors else None,
+        "lambda_orient": args.lambda_orient if args.supervise_target_factors else None,
         # Dataset split metadata.
         "split":             args.split,
         "corr_factor_a":     args.corr_factor_a if args.split == "correlated" else None,
@@ -428,15 +481,26 @@ def main():
 
     best_val_loss = float("inf")
     beta = t_cfg["beta"]
+    supervise = bool(args.supervise_target_factors)
+    lambda_scale  = float(args.lambda_scale)
+    lambda_orient = float(args.lambda_orient)
 
     for epoch in tqdm(range(1, t_cfg["epochs"] + 1), desc="Epochs"):
-        train_recon, train_kl = train_epoch(
-            vae, device, train_loader, optimizer, criterion, beta, amp=amp_enabled
+        train_recon, train_kl, train_aux_s, train_aux_o = train_epoch(
+            vae, device, train_loader, optimizer, criterion, beta,
+            amp=amp_enabled,
+            supervise=supervise,
+            lambda_scale=lambda_scale,
+            lambda_orient=lambda_orient,
         )
-        val_recon, val_kl = val_epoch(
-            vae, device, val_loader, criterion, beta, amp=amp_enabled
+        val_recon, val_kl, val_aux_s, val_aux_o = val_epoch(
+            vae, device, val_loader, criterion, beta,
+            amp=amp_enabled,
+            supervise=supervise,
         )
         val_loss = val_recon + beta * val_kl
+        if supervise:
+            val_loss = val_loss + lambda_scale * val_aux_s + lambda_orient * val_aux_o
 
         log = {
             "epoch":             epoch,
@@ -447,6 +511,11 @@ def main():
             "val/kl_loss":       val_kl,
             "val/total_loss":    val_loss,
         }
+        if supervise:
+            log["train/aux_scale"]  = train_aux_s
+            log["train/aux_orient"] = train_aux_o
+            log["val/aux_scale"]    = val_aux_s
+            log["val/aux_orient"]   = val_aux_o
 
         if epoch % log_cfg["log_interval"] == 0 or epoch == 1:
             log["viz/reconstructions"] = make_recon_grid(

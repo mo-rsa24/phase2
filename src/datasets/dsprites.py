@@ -147,10 +147,10 @@ class DSpritesDataset(Dataset):
         if torch is None:
             raise ImportError("PyTorch is required for DSpritesDataset. Install with: pip install torch")
 
-        self.imgs = dataset["imgs"][indices].astype(np.float32)
-        if normalize:
-            # Already binary, just cast to float
-            pass
+        # Keep imgs as uint8 — dSprites is binary 0/1, so float32 is a 4× memory
+        # blow-up that gets duplicated across DataLoader workers (COW dies once
+        # Python refcount writes dirty the pages). Cast per-batch in __getitem__.
+        self.imgs = dataset["imgs"][indices]
         self.latents = dataset["latents_classes"][indices]
         self.normalize = normalize
 
@@ -158,7 +158,7 @@ class DSpritesDataset(Dataset):
         return len(self.imgs)
 
     def __getitem__(self, idx):
-        img = torch.from_numpy(self.imgs[idx])
+        img = torch.from_numpy(self.imgs[idx]).float()
         # Add channel dimension: (64, 64) -> (1, 64, 64)
         img = img.unsqueeze(0)
         latents = torch.from_numpy(self.latents[idx]).long()
