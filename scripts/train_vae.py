@@ -1,44 +1,41 @@
 #!/usr/bin/env python3
+"""Train a baseline / β-VAE on dSprites.
+
+This script is the canonical *unsupervised* trainer: it covers Exps 1–4 of
+the disentanglement sweep (β=1, β=4, z=4, z=20). Targeted weak-supervision
+runs live in `scripts/train_supervised_vae.py`; FactorVAE in
+`scripts/train_factorvae.py`.
+
+Shared scaffolding (device probe, dataloaders, wandb init, viz helpers,
+checkpoint save) lives in `src/utils/train_runtime.py` and `src/utils/viz.py`
+so all three trainers share one implementation of those concerns.
+"""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
-import io
-import socket
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
-from sklearn.decomposition import PCA
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.data
 from tqdm import tqdm
-import yaml
 import wandb
 
-from src.datasets.dsprites import (
-    DSpritesDataset,
-    FACTOR_NAMES,
-    load_dsprites,
-    make_iid_split,
-)
-from src.datasets.correlated_dsprites import (
-    make_correlated_split,
-    make_heldout_pair_split,
-)
 from src.models.vae import VAE
-from src.utils.factor_targets import (
-    Z_ORIENT_IDX,
-    Z_SCALE_IDX,
-    orient_target,
-    scale_target,
+from src.utils.train_runtime import (
+    apply_common_overrides,
+    autocast_ctx,
+    base_flat_config,
+    build_data_loaders,
+    init_wandb,
+    load_config,
+    maybe_compile,
+    save_checkpoint,
+    seed_everything,
+    setup_device,
 )
+from src.utils.viz import make_pca_manifold, make_recon_grid
 
 
 def parse_args():
@@ -57,24 +54,16 @@ def parse_args():
     p.add_argument("--split",           type=str, default="iid",
                    choices=["iid", "correlated", "heldout"],
                    help="Which dSprites split to train on.")
-    p.add_argument("--corr-factor-a",   type=str, default="scale",
-                   help="First correlated factor (when --split=correlated).")
-    p.add_argument("--corr-factor-b",   type=str, default="orientation",
-                   help="Second correlated factor (when --split=correlated).")
+    p.add_argument("--corr-factor-a",   type=str, default="scale")
+    p.add_argument("--corr-factor-b",   type=str, default="orientation")
     p.add_argument("--corr-direction",  type=str, default="positive",
-                   choices=["positive", "negative"],
-                   help="Direction of injected correlation (when --split=correlated).")
-    p.add_argument("--heldout-factor-a", type=str, default="shape",
-                   help="First factor of held-out cells (when --split=heldout).")
-    p.add_argument("--heldout-factor-b", type=str, default="scale",
-                   help="Second factor of held-out cells (when --split=heldout).")
-    p.add_argument("--heldout-a-vals",   type=int, nargs="*", default=[2],
-                   help="Held-out values for factor A (when --split=heldout).")
-    p.add_argument("--heldout-b-vals",   type=int, nargs="*", default=[4, 5],
-                   help="Held-out values for factor B (when --split=heldout).")
+                   choices=["positive", "negative"])
+    p.add_argument("--heldout-factor-a", type=str, default="shape")
+    p.add_argument("--heldout-factor-b", type=str, default="scale")
+    p.add_argument("--heldout-a-vals",   type=int, nargs="*", default=[2])
+    p.add_argument("--heldout-b-vals",   type=int, nargs="*", default=[4, 5])
     # Runtime overlay key in configs/vae.yaml -> runtime.{key}.
-    p.add_argument("--runtime",         type=str,   default=None,
-                   help="Runtime overlay key (e.g. 'hippo', 'cluster48').")
+    p.add_argument("--runtime",         type=str,   default=None)
     # W&B metadata.
     p.add_argument("--wandb-run-name",  type=str, default=None)
     p.add_argument("--wandb-group",     type=str, default=None)
@@ -82,242 +71,54 @@ def parse_args():
     p.add_argument("--wandb-notes",     type=str, default=None)
     p.add_argument("--purpose",         type=str, default=None)
     p.add_argument("--experiment-id",   type=int, default=None)
-    p.add_argument("--node",            type=str, default=None,
-                   help="Node label logged with the run (hippo, mscluster106, ...).")
-    # Targeted weak-supervision (Phase 2f): pin scale to z0 and orientation to (z1, z2)
-    # via an auxiliary regression loss on `mu`. Off by default so existing
-    # beta-VAE / FactorVAE runs are byte-identical.
-    p.add_argument("--supervise-target-factors", action="store_true",
-                   help="Add MSE supervision on mu[:,0] (scale) and mu[:,1:3] (sin/cos of k*theta).")
-    p.add_argument("--lambda-scale",   type=float, default=1.0,
-                   help="Weight on scale supervision (used only with --supervise-target-factors).")
-    p.add_argument("--lambda-orient",  type=float, default=1.0,
-                   help="Weight on orientation supervision (used only with --supervise-target-factors).")
+    p.add_argument("--node",            type=str, default=None)
     # Perf escape hatch.
     p.add_argument("--no-compile",      action="store_true",
                    help="Disable torch.compile (use if compilation breaks on a node).")
     return p.parse_args()
 
 
-def probe_device() -> dict:
-    """Print device info; abort if installed torch wheel can't run on the GPU."""
-    info = {
-        "host":                  socket.gethostname(),
-        "torch":                 torch.__version__,
-        "cuda_visible_devices":  os.environ.get("CUDA_VISIBLE_DEVICES", ""),
-    }
-    if not torch.cuda.is_available():
-        info["device"] = "cpu"
-        print(f"[device] cpu  host={info['host']}  torch={info['torch']}")
-        return info
-
-    props = torch.cuda.get_device_properties(0)
-    sm = f"sm_{props.major}{props.minor}"
-    arch_list = torch.cuda.get_arch_list()
-    info.update({
-        "device":     "cuda",
-        "gpu_name":   props.name,
-        "gpu_sm":     sm,
-        "vram_gb":    round(props.total_memory / 1e9, 1),
-        "arch_list":  arch_list,
-    })
-    print(f"[device] cuda  gpu={props.name}  sm={sm}  vram={info['vram_gb']}GB  "
-          f"torch={info['torch']}  CUDA_VISIBLE_DEVICES={info['cuda_visible_devices']}")
-    print(f"[device] torch arch_list={arch_list}")
-
-    return info
-
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def seed_everything(seed: int):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-# ---------------------------------------------------------------------------
-# Visualisation helpers
-# ---------------------------------------------------------------------------
-
-def make_recon_grid(vae: VAE, loader, device, n: int = 8) -> wandb.Image:
-    """Two-row image strip: original on top, reconstruction below."""
-    vae.eval()
-    x, _ = next(iter(loader))
-    x = x[:n].to(device)
-    with torch.no_grad():
-        x_hat, _, _ = vae(x)
-    x     = x.cpu().numpy()      # (n, 1, 64, 64)
-    x_hat = x_hat.cpu().numpy()
-
-    row_orig  = np.concatenate([x[i, 0]     for i in range(n)], axis=1)
-    row_recon = np.concatenate([x_hat[i, 0] for i in range(n)], axis=1)
-
-    gap = np.ones((4, row_orig.shape[1]), dtype=np.float32)
-    grid = np.concatenate([row_orig, gap, row_recon], axis=0)
-    grid_uint8 = (np.clip(grid, 0.0, 1.0) * 255).astype(np.uint8)
-    return wandb.Image(grid_uint8, caption="Top: original  |  Bottom: reconstruction")
-
-
-def make_pca_manifold(
-    vae: VAE, loader, device, n_samples: int = 5000
-) -> wandb.Image:
-    """6-panel PCA scatter of latent mu, one panel per generative factor."""
-    vae.eval()
-    all_mu, all_latents = [], []
-    collected = 0
-    with torch.no_grad():
-        for x, latents in loader:
-            if collected >= n_samples:
-                break
-            remaining = n_samples - collected
-            x_batch = x[:remaining].to(device)
-            _, mu, _ = vae(x_batch)
-            all_mu.append(mu.cpu().numpy())
-            all_latents.append(latents[:remaining].numpy())
-            collected += x_batch.shape[0]
-
-    all_mu      = np.concatenate(all_mu,      axis=0)  # (N, latent_dim)
-    all_latents = np.concatenate(all_latents, axis=0)  # (N, 6)
-
-    if all_mu.shape[1] < 2:
-        return None
-
-    pca = PCA(n_components=2)
-    coords = pca.fit_transform(all_mu)
-    var = pca.explained_variance_ratio_
-
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
-    axes = axes.flatten()
-    for i, name in enumerate(FACTOR_NAMES):
-        classes = all_latents[:, i].astype(float)
-        n_cls   = int(classes.max()) + 1
-        cmap    = "tab20" if n_cls > 10 else "tab10"
-        sc = axes[i].scatter(
-            coords[:, 0], coords[:, 1],
-            c=classes, cmap=cmap, s=4, alpha=0.5, rasterized=True
-        )
-        plt.colorbar(sc, ax=axes[i], fraction=0.03, pad=0.04)
-        axes[i].set_title(f"Colored by: {name}  ({n_cls} classes)", fontsize=11)
-        axes[i].set_xlabel(f"PC1 ({var[0]*100:.1f}% var)", fontsize=9)
-        axes[i].set_ylabel(f"PC2 ({var[1]*100:.1f}% var)", fontsize=9)
-        axes[i].tick_params(labelsize=7)
-
-    fig.suptitle(
-        f"Latent PCA Manifold  (N={len(all_mu)}, latent_dim={all_mu.shape[1]})",
-        fontsize=13, y=1.01,
-    )
-    fig.tight_layout()
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-    buf.seek(0)
-    img = wandb.Image(
-        Image.open(buf),
-        caption="PCA of latent μ vectors, colored by ground-truth factors",
-    )
-    plt.close(fig)
-    return img
-
-
 # ---------------------------------------------------------------------------
 # Training / validation
 # ---------------------------------------------------------------------------
 
-def _autocast_ctx(device: torch.device, enabled: bool):
-    if enabled and device.type == "cuda":
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    return torch.autocast(device_type="cpu", enabled=False)
-
-
-def _aux_losses(mu: torch.Tensor, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute scale and orientation supervision losses on `mu`.
-
-    `latents` is the (B, 6) long tensor returned by DSpritesDataset:
-    indices are [color, shape, scale, orientation, pos_x, pos_y].
-    """
-    shape_idx  = latents[:, 1]
-    scale_idx  = latents[:, 2]
-    orient_idx = latents[:, 3]
-    s_target = scale_target(scale_idx)
-    o_target = orient_target(orient_idx, shape_idx)
-    mu32 = mu.float()
-    aux_scale  = F.mse_loss(mu32[:, Z_SCALE_IDX], s_target)
-    aux_orient = F.mse_loss(mu32[:, Z_ORIENT_IDX[0]:Z_ORIENT_IDX[1] + 1], o_target)
-    return aux_scale, aux_orient
-
-
-def train_epoch(vae, device, loader, optimizer, criterion, beta, *,
-                amp: bool, supervise: bool = False,
-                lambda_scale: float = 0.0, lambda_orient: float = 0.0):
+def train_epoch(vae, device, loader, optimizer, criterion, beta, *, amp: bool):
     vae.train()
     total_recon = total_kl = 0.0
-    total_aux_scale = total_aux_orient = 0.0
     total_samples = 0
-    for x, latents in loader:
+    for x, _ in loader:
         x = x.to(device, non_blocking=True)
-        if supervise:
-            latents = latents.to(device, non_blocking=True)
         batch_size = x.shape[0]
         optimizer.zero_grad(set_to_none=True)
-        with _autocast_ctx(device, amp):
+        with autocast_ctx(device, amp):
             x_hat, mu, logvar = vae(x)
             kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
         recon_loss = criterion(x_hat.float(), x.float())
         loss       = recon_loss + beta * kl_loss
-        if supervise:
-            aux_scale, aux_orient = _aux_losses(mu, latents)
-            loss = loss + lambda_scale * aux_scale + lambda_orient * aux_orient
-            total_aux_scale  += aux_scale.item()  * batch_size
-            total_aux_orient += aux_orient.item() * batch_size
         loss.backward()
         optimizer.step()
         total_recon  += recon_loss.item() * batch_size
-        total_kl     += kl_loss.item() * batch_size
+        total_kl     += kl_loss.item()    * batch_size
         total_samples += batch_size
-    return (
-        total_recon / total_samples,
-        total_kl / total_samples,
-        total_aux_scale / total_samples,
-        total_aux_orient / total_samples,
-    )
+    return total_recon / total_samples, total_kl / total_samples
 
 
-def val_epoch(vae, device, loader, criterion, beta, *,
-              amp: bool, supervise: bool = False):
+def val_epoch(vae, device, loader, criterion, beta, *, amp: bool):
     vae.eval()
     total_recon = total_kl = 0.0
-    total_aux_scale = total_aux_orient = 0.0
     total_samples = 0
     with torch.no_grad():
-        for x, latents in loader:
+        for x, _ in loader:
             x = x.to(device, non_blocking=True)
-            if supervise:
-                latents = latents.to(device, non_blocking=True)
             batch_size = x.shape[0]
-            with _autocast_ctx(device, amp):
+            with autocast_ctx(device, amp):
                 x_hat, mu, logvar = vae(x)
                 kl    = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch_size
             recon = criterion(x_hat.float(), x.float())
             total_recon  += recon.item() * batch_size
-            total_kl     += kl.item() * batch_size
-            if supervise:
-                aux_scale, aux_orient = _aux_losses(mu, latents)
-                total_aux_scale  += aux_scale.item()  * batch_size
-                total_aux_orient += aux_orient.item() * batch_size
+            total_kl     += kl.item()    * batch_size
             total_samples += batch_size
-    return (
-        total_recon / total_samples,
-        total_kl / total_samples,
-        total_aux_scale / total_samples,
-        total_aux_orient / total_samples,
-    )
+    return total_recon / total_samples, total_kl / total_samples
 
 
 # ---------------------------------------------------------------------------
@@ -334,73 +135,17 @@ def main():
     log_cfg = cfg["logging"]
     rt_cfg  = (cfg.get("runtime") or {}).get(args.runtime, {}) if args.runtime else {}
 
-    # --- Apply CLI overrides (CLI > runtime overlay > YAML defaults) ---
-    if args.latent_dim  is not None: m_cfg["latent_dim"]  = args.latent_dim
-    if args.beta        is not None: t_cfg["beta"]        = args.beta
-    if args.seed        is not None: t_cfg["seed"]        = args.seed
-    if args.epochs      is not None: t_cfg["epochs"]      = args.epochs
-    if args.batch_size  is not None: t_cfg["batch_size"]  = args.batch_size
-    elif "batch_size"  in rt_cfg:   t_cfg["batch_size"]  = rt_cfg["batch_size"]
-    num_workers = args.num_workers if args.num_workers is not None else rt_cfg.get("num_workers", 4)
+    # CLI > runtime > YAML for the keys every trainer shares.
+    num_workers = apply_common_overrides(args, m_cfg, t_cfg, rt_cfg)
+    # Objective-specific override (β belongs to this trainer).
+    if args.beta is not None: t_cfg["beta"] = args.beta
 
-    # --- Device probe and perf knobs ---
-    dev_info = probe_device()
-    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.set_float32_matmul_precision("high")
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    amp_enabled = device.type == "cuda"
-
+    device, amp_enabled, dev_info = setup_device()
     seed_everything(t_cfg["seed"])
 
-    # --- Data ---
-    dataset = load_dsprites(args.data_dir)
-    heldout_idx = None  # populated only when --split=heldout
-    if args.split == "iid":
-        train_idx, val_idx, _ = make_iid_split(
-            dataset,
-            train_frac=d_cfg["train_frac"],
-            val_frac=d_cfg["val_frac"],
-            seed=t_cfg["seed"],
-        )
-        print(f"[data] split=iid  train={len(train_idx)}  val={len(val_idx)}")
-    elif args.split == "correlated":
-        train_idx, val_idx, _ = make_correlated_split(
-            dataset,
-            factor_a=args.corr_factor_a,
-            factor_b=args.corr_factor_b,
-            correlation=args.corr_direction,
-            train_frac=d_cfg["train_frac"],
-            seed=t_cfg["seed"],
-        )
-        print(f"[data] split=correlated({args.corr_factor_a},{args.corr_factor_b},"
-              f"{args.corr_direction})  train={len(train_idx)}  val={len(val_idx)}")
-    elif args.split == "heldout":
-        train_idx, val_idx, _, heldout_idx = make_heldout_pair_split(
-            dataset,
-            factor_a=args.heldout_factor_a,
-            factor_b=args.heldout_factor_b,
-            held_a_vals=args.heldout_a_vals,
-            held_b_vals=args.heldout_b_vals,
-            seed=t_cfg["seed"],
-        )
-        print(f"[data] split=heldout({args.heldout_factor_a}={args.heldout_a_vals},"
-              f"{args.heldout_factor_b}={args.heldout_b_vals})  "
-              f"train={len(train_idx)}  val={len(val_idx)}  heldout={len(heldout_idx)}")
-    else:
-        raise ValueError(f"unknown split: {args.split}")
-    train_ds = DSpritesDataset(dataset, train_idx)
-    val_ds   = DSpritesDataset(dataset, val_idx)
-    loader_kwargs = dict(
-        batch_size=t_cfg["batch_size"],
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(num_workers > 0),
+    train_loader, val_loader, heldout_idx = build_data_loaders(
+        args, d_cfg, t_cfg, device, num_workers
     )
-    train_loader = torch.utils.data.DataLoader(train_ds, shuffle=True,  **loader_kwargs)
-    val_loader   = torch.utils.data.DataLoader(val_ds,   shuffle=False, **loader_kwargs)
 
     # --- Model ---
     img_size = torch.Size(m_cfg["img_size"])
@@ -411,96 +156,38 @@ def main():
         weight_decay=t_cfg["weight_decay"],
         fused=(device.type == "cuda"),
     )
-    # dSprites pixels are binary and the decoder ends in Sigmoid, so use the
-    # Bernoulli negative log-likelihood per sample. A global mean MSE makes the
-    # reconstruction term about 4096x smaller than the KL term on 64x64 images.
+    # dSprites pixels are binary and the decoder ends in Sigmoid → Bernoulli NLL
+    # summed over pixels and averaged over the batch.
     def criterion(x_hat, x):
         return F.binary_cross_entropy(x_hat.float(), x.float(), reduction="sum") / x.shape[0]
 
-    if not args.no_compile and device.type == "cuda":
-        try:
-            vae = torch.compile(vae)
-            print("[perf] torch.compile enabled")
-        except Exception as e:
-            print(f"[perf] torch.compile skipped: {e}")
-    else:
-        print("[perf] torch.compile disabled")
+    vae = maybe_compile(vae, args.no_compile, device)
 
-    # --- wandb ---
-    flat_cfg = {
-        "latent_dim":   m_cfg["latent_dim"],
-        "img_size":     str(img_size),
-        "epochs":       t_cfg["epochs"],
-        "batch_size":   t_cfg["batch_size"],
-        "lr":           t_cfg["lr"],
-        "weight_decay": t_cfg["weight_decay"],
-        "beta":         t_cfg["beta"],
-        "recon_loss":   "bce_sum_per_sample",
-        "seed":         t_cfg["seed"],
-        "train_frac":   d_cfg["train_frac"],
-        "val_frac":     d_cfg["val_frac"],
-        "num_workers":  num_workers,
-        "amp_dtype":    "bfloat16" if amp_enabled else "fp32",
-        # Targeted weak-supervision metadata.
-        "supervise_target_factors": args.supervise_target_factors,
-        "lambda_scale":  args.lambda_scale  if args.supervise_target_factors else None,
-        "lambda_orient": args.lambda_orient if args.supervise_target_factors else None,
-        # Dataset split metadata.
-        "split":             args.split,
-        "corr_factor_a":     args.corr_factor_a if args.split == "correlated" else None,
-        "corr_factor_b":     args.corr_factor_b if args.split == "correlated" else None,
-        "corr_direction":    args.corr_direction if args.split == "correlated" else None,
-        "heldout_factor_a":  args.heldout_factor_a if args.split == "heldout" else None,
-        "heldout_factor_b":  args.heldout_factor_b if args.split == "heldout" else None,
-        "heldout_a_vals":    list(args.heldout_a_vals) if args.split == "heldout" else None,
-        "heldout_b_vals":    list(args.heldout_b_vals) if args.split == "heldout" else None,
-        "experiment_id": args.experiment_id,
-        "purpose":       args.purpose,
-        "sweep_name":    args.wandb_group,
-        "node":          args.node,
-        "runtime":       args.runtime,
-        "host":          dev_info.get("host"),
-        "gpu_name":      dev_info.get("gpu_name"),
-        "gpu_sm":        dev_info.get("gpu_sm"),
-        "vram_gb":       dev_info.get("vram_gb"),
-        "cuda_visible_devices": dev_info.get("cuda_visible_devices"),
-    }
-    run = wandb.init(
-        project=log_cfg["wandb_project"],
-        name=args.wandb_run_name,
-        group=args.wandb_group,
-        tags=args.wandb_tags,
-        notes=args.wandb_notes,
-        config=flat_cfg,
+    # --- W&B ---
+    flat_cfg = base_flat_config(
+        args, m_cfg, t_cfg, d_cfg, dev_info, num_workers, amp_enabled,
+        img_size=img_size,
     )
+    flat_cfg["beta"] = t_cfg["beta"]
+    run = init_wandb(log_cfg, args, flat_cfg)
 
     # --- Output dir ---
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    best_ckpt = out_dir / "best.pt"
+    best_ckpt  = out_dir / "best.pt"
+    final_ckpt = out_dir / "final.pt"
 
     best_val_loss = float("inf")
     beta = t_cfg["beta"]
-    supervise = bool(args.supervise_target_factors)
-    lambda_scale  = float(args.lambda_scale)
-    lambda_orient = float(args.lambda_orient)
 
     for epoch in tqdm(range(1, t_cfg["epochs"] + 1), desc="Epochs"):
-        train_recon, train_kl, train_aux_s, train_aux_o = train_epoch(
-            vae, device, train_loader, optimizer, criterion, beta,
-            amp=amp_enabled,
-            supervise=supervise,
-            lambda_scale=lambda_scale,
-            lambda_orient=lambda_orient,
+        train_recon, train_kl = train_epoch(
+            vae, device, train_loader, optimizer, criterion, beta, amp=amp_enabled
         )
-        val_recon, val_kl, val_aux_s, val_aux_o = val_epoch(
-            vae, device, val_loader, criterion, beta,
-            amp=amp_enabled,
-            supervise=supervise,
+        val_recon, val_kl = val_epoch(
+            vae, device, val_loader, criterion, beta, amp=amp_enabled
         )
         val_loss = val_recon + beta * val_kl
-        if supervise:
-            val_loss = val_loss + lambda_scale * val_aux_s + lambda_orient * val_aux_o
 
         log = {
             "epoch":             epoch,
@@ -511,11 +198,6 @@ def main():
             "val/kl_loss":       val_kl,
             "val/total_loss":    val_loss,
         }
-        if supervise:
-            log["train/aux_scale"]  = train_aux_s
-            log["train/aux_orient"] = train_aux_o
-            log["val/aux_scale"]    = val_aux_s
-            log["val/aux_orient"]   = val_aux_o
 
         if epoch % log_cfg["log_interval"] == 0 or epoch == 1:
             log["viz/reconstructions"] = make_recon_grid(
@@ -531,7 +213,7 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            ckpt_dict = {
+            payload = {
                 "epoch":                epoch,
                 "model_state_dict":     vae.state_dict(),
                 "encoder_state_dict":   vae.encoder.state_dict(),
@@ -541,12 +223,11 @@ def main():
                 "config":               flat_cfg,
             }
             if heldout_idx is not None:
-                ckpt_dict["heldout_idx"] = heldout_idx.tolist()
-            torch.save(ckpt_dict, best_ckpt)
+                payload["heldout_idx"] = heldout_idx.tolist()
+            save_checkpoint(best_ckpt, payload)
 
     # --- Final checkpoint + artifact ---
-    final_ckpt = out_dir / "final.pt"
-    final_dict = {
+    final_payload = {
         "epoch":              t_cfg["epochs"],
         "model_state_dict":   vae.state_dict(),
         "encoder_state_dict": vae.encoder.state_dict(),
@@ -554,8 +235,8 @@ def main():
         "config":             flat_cfg,
     }
     if heldout_idx is not None:
-        final_dict["heldout_idx"] = heldout_idx.tolist()
-    torch.save(final_dict, final_ckpt)
+        final_payload["heldout_idx"] = heldout_idx.tolist()
+    save_checkpoint(final_ckpt, final_payload)
 
     artifact = wandb.Artifact(name="vae-checkpoint", type="model")
     artifact.add_file(str(final_ckpt))

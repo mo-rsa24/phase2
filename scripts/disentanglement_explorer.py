@@ -12,7 +12,7 @@ Usage
 -----
     # Preload a checkpoint:
     python scripts/disentanglement_explorer.py \\
-        --checkpoint checkpoints/vae/vae_z10_beta1.0_seed42/best.pt
+        --checkpoint checkpoints/vae/vae_z10_beta1.0_seed42/final.pt
 
     # Or just open the UI and click a preset:
     python scripts/disentanglement_explorer.py
@@ -28,7 +28,11 @@ import base64
 import io
 import json
 import re
+import shlex
+import subprocess
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -64,58 +68,89 @@ EXPERIMENTS = [
     {"id": 1, "label": "Exp 1 — z=10, β=1.0", "purpose": "Baseline VAE",
      "split": "iid",
      "latent_dim": 10, "beta": 1.0, "seed": 42,
-     "checkpoint": "checkpoints/vae/vae_z10_beta1.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/vae/vae_z10_beta1.0_seed42/final.pt"},
     {"id": 2, "label": "Exp 2 — z=10, β=4.0", "purpose": "β-VAE",
      "split": "iid",
      "latent_dim": 10, "beta": 4.0, "seed": 42,
-     "checkpoint": "checkpoints/vae/vae_z10_beta4.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/vae/vae_z10_beta4.0_seed42/final.pt"},
     {"id": 3, "label": "Exp 3 — z=4, β=1.0",  "purpose": "Undercomplete",
      "split": "iid",
      "latent_dim":  4, "beta": 1.0, "seed": 42,
-     "checkpoint": "checkpoints/vae/vae_z4_beta1.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/vae/vae_z4_beta1.0_seed42/final.pt"},
     {"id": 4, "label": "Exp 4 — z=20, β=1.0", "purpose": "Overcomplete",
      "split": "iid",
      "latent_dim": 20, "beta": 1.0, "seed": 42,
-     "checkpoint": "checkpoints/vae/vae_z20_beta1.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/vae/vae_z20_beta1.0_seed42/final.pt"},
     {"id": 5, "label": "Exp 5 — z=10, γ=35.0", "purpose": "FactorVAE",
      "split": "iid",
      "latent_dim": 10, "beta": None, "gamma": 35.0, "seed": 42,
-     "checkpoint": "checkpoints/factor_vae/factorvae_z10_gamma35.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/factor_vae/factorvae_z10_gamma35.0_seed42/final.pt"},
     # ---- Phase 2b: correlated (scale, orientation+) split (Exp 6–10) ---
     {"id": 6, "label": "Exp 6 — corr · z=10, β=1.0", "purpose": "Baseline VAE (corr)",
      "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
      "corr_direction": "positive",
      "latent_dim": 10, "beta": 1.0, "seed": 42,
-     "checkpoint": "checkpoints/vae/correlated_vae_z10_beta1.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/vae/correlated_vae_z10_beta1.0_seed42/final.pt"},
     {"id": 7, "label": "Exp 7 — corr · z=10, β=4.0", "purpose": "β-VAE (corr)",
      "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
      "corr_direction": "positive",
      "latent_dim": 10, "beta": 4.0, "seed": 42,
-     "checkpoint": "checkpoints/vae/correlated_vae_z10_beta4.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/vae/correlated_vae_z10_beta4.0_seed42/final.pt"},
     {"id": 8, "label": "Exp 8 — corr · z=4, β=1.0",  "purpose": "Undercomplete (corr)",
      "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
      "corr_direction": "positive",
      "latent_dim":  4, "beta": 1.0, "seed": 42,
-     "checkpoint": "checkpoints/vae/correlated_vae_z4_beta1.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/vae/correlated_vae_z4_beta1.0_seed42/final.pt"},
     {"id": 9, "label": "Exp 9 — corr · z=20, β=1.0", "purpose": "Overcomplete (corr)",
      "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
      "corr_direction": "positive",
      "latent_dim": 20, "beta": 1.0, "seed": 42,
-     "checkpoint": "checkpoints/vae/correlated_vae_z20_beta1.0_seed42/best.pt"},
+     "checkpoint": "checkpoints/vae/correlated_vae_z20_beta1.0_seed42/final.pt"},
     {"id": 10, "label": "Exp 10 — corr · z=10, γ=35.0", "purpose": "FactorVAE (corr)",
      "split": "correlated", "corr_factor_a": "scale", "corr_factor_b": "orientation",
      "corr_direction": "positive",
      "latent_dim": 10, "beta": None, "gamma": 35.0, "seed": 42,
-     "checkpoint": "checkpoints/factor_vae/correlated_factorvae_z10_gamma35.0_seed42/best.pt"},
-    # ---- Phase 2f: targeted weak supervision (Exp 11+) -----------------
+     "checkpoint": "checkpoints/factor_vae/correlated_factorvae_z10_gamma35.0_seed42/final.pt"},
+    # ---- Phase 2f: targeted weak supervision (Exps 20–23) ---------------
     # `group` overrides the split-based card grouping in the template so
     # supervised runs render under their own header even though the data
-    # split is still iid.
-    {"id": 11, "label": "Exp 11 — sup · z=10, β=1.0", "purpose": "Targeted-supervision VAE",
+    # split is still iid. Each `checkpoint` field is the canonical seed=0 path;
+    # `_seeds_by_exp` discovers other seeds by globbing _seed*.
+    {"id": 20, "label": "Exp 20 — sup-A diagnostic (λ=1, β_sup=1)",
+     "purpose": "Diagnostic: reproduces v1 failure",
      "split": "iid", "group": "supervised",
-     "supervised": True, "lambda_scale": 1.0, "lambda_orient": 1.0,
+     "supervised": True, "lambda_scale": 1.0, "lambda_orient": 1.0, "beta_supervised": 1.0,
      "latent_dim": 10, "beta": 1.0, "seed": 0,
-     "checkpoint": "checkpoints/vae/supervised_vae_z10_beta1.0_seed0/best.pt"},
+     "checkpoint": "checkpoints/vae/supervised_vae_z10_beta1.0_lambda1.0_betasup1.0_seed0/final.pt"},
+    {"id": 21, "label": "Exp 21 — sup-B brute-λ (λ=50, β_sup=1)",
+     "purpose": "Brute-force λ; KL still on supervised dims",
+     "split": "iid", "group": "supervised",
+     "supervised": True, "lambda_scale": 50.0, "lambda_orient": 50.0, "beta_supervised": 1.0,
+     "latent_dim": 10, "beta": 1.0, "seed": 0,
+     "checkpoint": "checkpoints/vae/supervised_vae_z10_beta1.0_lambda50.0_betasup1.0_seed0/final.pt"},
+    {"id": 22, "label": "Exp 22 — sup-C per-dim β (λ=1, β_sup=0)",
+     "purpose": "Per-dim β alone, modest λ",
+     "split": "iid", "group": "supervised",
+     "supervised": True, "lambda_scale": 1.0, "lambda_orient": 1.0, "beta_supervised": 0.0,
+     "latent_dim": 10, "beta": 1.0, "seed": 0,
+     "checkpoint": "checkpoints/vae/supervised_vae_z10_beta1.0_lambda1.0_betasup0.0_seed0/final.pt"},
+    {"id": 23, "label": "Exp 23 — sup-D recommended (λ=10, β_sup=0)",
+     "purpose": "Both fixes — expected winner",
+     "split": "iid", "group": "supervised",
+     "supervised": True, "lambda_scale": 10.0, "lambda_orient": 10.0, "beta_supervised": 0.0,
+     "latent_dim": 10, "beta": 1.0, "seed": 0,
+     "checkpoint": "checkpoints/vae/supervised_vae_z10_beta1.0_lambda10.0_betasup0.0_seed0/final.pt"},
+    # ---- Phase 2g: stronger β-VAE for clean axis-alignment (Exps 30–31) ---
+    # Default to seed=0 since none have been trained yet — `_seeds_by_exp`
+    # globs `_seed*/` so any seeds added later auto-populate the dropdown.
+    {"id": 30, "label": "Exp 30 — z=10, β=8.0", "purpose": "β-VAE strong",
+     "split": "iid",
+     "latent_dim": 10, "beta": 8.0, "seed": 0,
+     "checkpoint": "checkpoints/vae/vae_z10_beta8.0_seed0_e100/final.pt"},
+    {"id": 31, "label": "Exp 31 — z=10, β=16.0", "purpose": "β-VAE stronger",
+     "split": "iid",
+     "latent_dim": 10, "beta": 16.0, "seed": 0,
+     "checkpoint": "checkpoints/vae/vae_z10_beta16.0_seed0_e100/final.pt"},
 ]
 
 
@@ -233,7 +268,7 @@ def _seeds_by_exp() -> dict[int, list[dict]]:
     """Discover available seeds on disk for each EXPERIMENTS entry.
 
     For each experiment, glob the checkpoint path with the seed segment
-    replaced by a wildcard (e.g. ``vae_z10_beta1.0_seed*/best.pt``) and
+    replaced by a wildcard (e.g. ``vae_z10_beta1.0_seed*/final.pt``) and
     parse the seed back from each match. Returns ``{exp.id: [{seed, path}, ...]}``
     sorted ascending by seed. Empty list if no checkpoints exist yet.
     """
@@ -363,6 +398,15 @@ def api_load():
     path = Path((request.json or {}).get("checkpoint", "").strip())
     if not str(path):
         return jsonify({"error": "No checkpoint path provided"}), 400
+    # Legacy support: existing browser bookmarks / external scripts may still
+    # post "…/best.pt" paths even though disentanglement work prefers the
+    # end-of-training latent geometry in `final.pt`. If a sibling final.pt
+    # exists, transparently swap to it. (`best.pt` selects on lowest val ELBO,
+    # which is rarely the best-disentangled epoch for β-VAE.)
+    if path.name == "best.pt":
+        sibling_final = path.with_name("final.pt")
+        if sibling_final.exists():
+            path = sibling_final
     if not path.exists():
         return jsonify({"error": f"File not found: {path}"}), 404
     try:
@@ -998,7 +1042,7 @@ def _compute_compare_metrics(ckpt_path: str, n_samples: int = 3000) -> dict:
 def api_compare_metrics():
     """Compute (or return cached) summary metrics for a checkpoint.
 
-    Body: {"checkpoint": "checkpoints/.../best.pt"}.
+    Body: {"checkpoint": "checkpoints/.../final.pt"}.
     Used by the Compare tab to pin checkpoints. May take 30-60s the first
     time per checkpoint, then instant.
     """
@@ -1028,6 +1072,206 @@ def api_compare_metrics():
 def api_experiments():
     """Return the EXPERIMENTS table to the front-end (used by Compare picker)."""
     return jsonify({"experiments": EXPERIMENTS})
+
+
+# ── Train-new-seed: subprocess management ────────────────────────────────────
+#
+# Each training run is launched as a background subprocess invoking the same
+# `scripts/sweep_disentanglement.py` driver that `launch_sweep.sh` uses, so we
+# get identical run-name / out-dir conventions. Logs are tee'd to
+# `logs/explorer_training/<job_id>.log` and the front-end polls
+# `/api/train/jobs` for status. Jobs live in-memory only — restarting the
+# explorer drops the list (the underlying `nohup`-style processes keep
+# running because we don't kill children at shutdown).
+
+_TRAIN_LOG_DIR = Path("logs/explorer_training")
+_TRAIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SWEEP_SCRIPT = _REPO_ROOT / "scripts" / "sweep_disentanglement.py"
+
+_jobs_lock = threading.Lock()
+_jobs: dict[str, dict] = {}  # job_id -> metadata dict
+
+
+def _job_public(j: dict) -> dict:
+    """Return a JSON-safe view of a job (drop the live Popen handle)."""
+    return {k: v for k, v in j.items() if not k.startswith("_")}
+
+
+def _wait_for_job(job_id: str) -> None:
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+    if j is None:
+        return
+    rc = j["_proc"].wait()
+    try:
+        j["_log_fh"].close()
+    except Exception:
+        pass
+    with _jobs_lock:
+        j["returncode"] = int(rc)
+        j["status"] = "done" if rc == 0 else "failed"
+        j["ended"] = datetime.now(timezone.utc).isoformat()
+
+
+def _spawn_training(
+    *, exp_id: int, seed: int, epochs: int | None,
+    gpu: str, runtime: str, node: str,
+) -> dict:
+    """Launch sweep_disentanglement.py as a detached subprocess.
+
+    Reuses the same CLI the bash launcher uses, so the resulting checkpoint
+    lands in the canonical path that `_seeds_by_exp` already discovers.
+    """
+    if not _SWEEP_SCRIPT.exists():
+        raise RuntimeError(f"sweep script not found at {_SWEEP_SCRIPT}")
+
+    job_id = f"{int(time.time())}-exp{exp_id}-seed{seed}"
+    log_path = _TRAIN_LOG_DIR / f"{job_id}.log"
+
+    cmd = [
+        sys.executable, "-u", str(_SWEEP_SCRIPT),
+        "--experiment-id", str(exp_id),
+        "--seed", str(seed),
+        "--runtime", runtime,
+        "--node", node,
+    ]
+    if epochs is not None:
+        cmd += ["--epochs", str(epochs)]
+
+    env = os.environ.copy()
+    if gpu:
+        env["CUDA_VISIBLE_DEVICES"] = gpu
+
+    log_fh = open(log_path, "w", buffering=1)
+    log_fh.write(f"# launched: {datetime.now(timezone.utc).isoformat()}\n")
+    log_fh.write(f"# cmd: {' '.join(shlex.quote(c) for c in cmd)}\n")
+    log_fh.write(f"# CUDA_VISIBLE_DEVICES={gpu}\n")
+    log_fh.flush()
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_fh, stderr=subprocess.STDOUT,
+        env=env, cwd=str(_REPO_ROOT),
+        # detach from the explorer's process group so SIGINT to the explorer
+        # doesn't cascade into the training run.
+        start_new_session=True,
+    )
+
+    job = {
+        "job_id":   job_id,
+        "exp_id":   int(exp_id),
+        "seed":     int(seed),
+        "epochs":   epochs,
+        "gpu":      gpu,
+        "runtime":  runtime,
+        "node":     node,
+        "pid":      proc.pid,
+        "log_path": str(log_path),
+        "started":  datetime.now(timezone.utc).isoformat(),
+        "ended":    None,
+        "status":   "running",
+        "returncode": None,
+        "_proc":    proc,
+        "_log_fh":  log_fh,
+    }
+    with _jobs_lock:
+        _jobs[job_id] = job
+    threading.Thread(target=_wait_for_job, args=(job_id,), daemon=True).start()
+    return _job_public(job)
+
+
+@app.route("/api/seeds")
+def api_seeds():
+    """Re-glob disk for available seeds — used to refresh dropdowns after a
+    training job finishes without reloading the page."""
+    return jsonify({"seeds_by_exp": _seeds_by_exp()})
+
+
+@app.route("/api/train/start", methods=["POST"])
+def api_train_start():
+    data = request.json or {}
+    try:
+        exp_id = int(data["exp_id"])
+        seed   = int(data["seed"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "exp_id and seed are required integers."}), 400
+
+    if not any(e["id"] == exp_id for e in EXPERIMENTS):
+        return jsonify({"error": f"Unknown experiment_id {exp_id}."}), 400
+    if not (0 <= seed <= 99999):
+        return jsonify({"error": "seed out of range."}), 400
+
+    epochs_raw = data.get("epochs")
+    epochs: int | None
+    if epochs_raw in (None, "", "null"):
+        epochs = None
+    else:
+        try:
+            epochs = int(epochs_raw)
+            if epochs <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"error": "epochs must be a positive integer."}), 400
+
+    gpu     = str(data.get("gpu", "0")).strip()
+    runtime = str(data.get("runtime", "hippo")).strip() or "hippo"
+    node    = str(data.get("node", runtime)).strip() or runtime
+
+    try:
+        info = _spawn_training(
+            exp_id=exp_id, seed=seed, epochs=epochs,
+            gpu=gpu, runtime=runtime, node=node,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "job": info})
+
+
+@app.route("/api/train/jobs")
+def api_train_jobs():
+    with _jobs_lock:
+        # Return newest first. The dict preserves insertion order, so reverse.
+        items = [_job_public(j) for j in _jobs.values()]
+    items.sort(key=lambda j: j["started"], reverse=True)
+    return jsonify({"jobs": items})
+
+
+@app.route("/api/train/job/<job_id>")
+def api_train_job(job_id: str):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+        snapshot = _job_public(j) if j else None
+    if snapshot is None:
+        return jsonify({"error": "unknown job_id"}), 404
+
+    # Tail the log file (last ~400 lines).
+    tail_lines = 400
+    log_text = ""
+    try:
+        with open(snapshot["log_path"]) as f:
+            data = f.readlines()
+        log_text = "".join(data[-tail_lines:])
+    except FileNotFoundError:
+        log_text = "(log file missing)"
+    snapshot["log_tail"] = log_text
+    return jsonify(snapshot)
+
+
+@app.route("/api/train/cancel/<job_id>", methods=["POST"])
+def api_train_cancel(job_id: str):
+    with _jobs_lock:
+        j = _jobs.get(job_id)
+    if j is None:
+        return jsonify({"error": "unknown job_id"}), 404
+    if j["status"] != "running":
+        return jsonify({"ok": True, "status": j["status"]})
+    try:
+        j["_proc"].terminate()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "status": "terminating"})
 
 
 # ── Launch ────────────────────────────────────────────────────────────────────

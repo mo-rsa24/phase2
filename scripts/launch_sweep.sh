@@ -16,6 +16,17 @@
 # Phase 2c — γ × recon sweep at 150 epochs (cells 11–13):
 #   --node hippo-gamma   → γ∈{10,20,35} sequentially on GPU 0 (~2h total)
 #
+# Phase 2f — targeted weak supervision sweep (cells 20–23):
+#   --node hippo-supervised → 4 supervised cells sequentially on GPU 0
+#   Run across seeds with:
+#     for s in 0 1 2; do bash scripts/launch_sweep.sh --node hippo-supervised --seed $s; done
+#
+# Phase 2 hardening — seed replication + stronger β-VAE:
+#   --node hippo-replicate → re-runs Exps 2 (β=4) and 5 (γ=35) sequentially.
+#     Fan out seeds 0..3 to fill the 5-seed grid (seed 42 already trained).
+#   --node hippo-betasweep → trains Exps 30 (β=8) and 31 (β=16) sequentially.
+#     Pass --epochs 100; loop seeds {0,1,2,3,42} to land 5 reps each.
+#
 # Assumes phase2-repr micromamba env, this repo, data/dsprites.npz, and
 # `wandb login` are already set up on the node.
 
@@ -125,11 +136,43 @@ case "$NODE" in
         ASSIGNMENTS=("11 0" "12 0" "13 0")
         PARALLEL=0
         ;;
+    # ---- Phase 2f: supervised sweep (cells 20–23), hippo or cluster48 ---
+    hippo-supervised)
+        RUNTIME="hippo"
+        ASSIGNMENTS=("20 0" "21 0" "22 0" "23 0")
+        PARALLEL=0
+        ;;
+    mscluster106-supervised)
+        RUNTIME="cluster48"
+        ASSIGNMENTS=("20 0" "21 1")
+        PARALLEL=1
+        ;;
+    mscluster107-supervised)
+        RUNTIME="cluster48"
+        ASSIGNMENTS=("22 0" "23 1")
+        PARALLEL=1
+        ;;
+    # ---- Phase 2 hardening: replicate seeds + stronger β-VAE -------------
+    hippo-replicate)
+        # Tier 1: missing seeds for Exp 2 (β=4) + Exp 5 (γ=35).
+        # Loop over --seed externally to fan out across {0,1,2,3}.
+        RUNTIME="hippo"
+        ASSIGNMENTS=("2 0" "5 0")
+        PARALLEL=0
+        ;;
+    hippo-betasweep)
+        # Tier 2: stronger β-VAE (β=8, β=16) at 100 epochs.
+        # Pass --epochs 100 on the command line; loop --seed over {0,1,2,3,42}.
+        RUNTIME="hippo"
+        ASSIGNMENTS=("30 0" "31 0")
+        PARALLEL=0
+        ;;
     *)
         echo "ERROR: --node must be one of:" >&2
         echo "  hippo|mscluster106|mscluster107|mscluster108" >&2
         echo "  hippo-corr|mscluster106-corr|mscluster107-corr|mscluster108-corr" >&2
         echo "  hippo-gamma" >&2
+        echo "  hippo-supervised|mscluster106-supervised|mscluster107-supervised" >&2
         echo "(got: $NODE)" >&2
         exit 2
         ;;
@@ -141,6 +184,7 @@ esac
 # strip the suffix when forwarding the tag downstream.
 NODE_TAG="${NODE%-corr}"
 NODE_TAG="${NODE_TAG%-gamma}"
+NODE_TAG="${NODE_TAG%-supervised}"
 
 # ---- Locate micromamba ----------------------------------------------------
 if command -v micromamba >/dev/null 2>&1; then
@@ -168,16 +212,28 @@ EXP_TRAINER[9]="vae";        EXP_SPLIT[9]="correlated"; EXP_LATENT[9]=20; EXP_BE
 EXP_TRAINER[10]="factor_vae"; EXP_SPLIT[10]="correlated"; EXP_LATENT[10]=10; EXP_GAMMA[10]=35.0; EXP_PURPOSE[10]="factor-vae-corr"
 # γ × recon-quality sweep at 150 epochs (cells 11–13) — name_suffix keeps
 # these from colliding with cell 5's checkpoint dir.
-declare -A EXP_SUFFIX
+declare -A EXP_SUFFIX EXP_LAMBDA EXP_BETASUP
 EXP_TRAINER[11]="factor_vae"; EXP_SPLIT[11]="iid"; EXP_LATENT[11]=10; EXP_GAMMA[11]=10.0; EXP_PURPOSE[11]="factor-vae-gsweep"; EXP_SUFFIX[11]="e150"
 EXP_TRAINER[12]="factor_vae"; EXP_SPLIT[12]="iid"; EXP_LATENT[12]=10; EXP_GAMMA[12]=20.0; EXP_PURPOSE[12]="factor-vae-gsweep"; EXP_SUFFIX[12]="e150"
 EXP_TRAINER[13]="factor_vae"; EXP_SPLIT[13]="iid"; EXP_LATENT[13]=10; EXP_GAMMA[13]=35.0; EXP_PURPOSE[13]="factor-vae-gsweep"; EXP_SUFFIX[13]="e150"
+# Targeted weak supervision (cells 20–23). λ_s=λ_o for this sweep so a single
+# token suffices in the path; if they ever diverge, update the python sweep
+# dispatcher's `run_name` and mirror here.
+EXP_TRAINER[20]="supervised_vae"; EXP_SPLIT[20]="iid"; EXP_LATENT[20]=10; EXP_BETA[20]=1.0; EXP_LAMBDA[20]=1.0;  EXP_BETASUP[20]=1.0; EXP_PURPOSE[20]="supervised-A-diagnostic"
+EXP_TRAINER[21]="supervised_vae"; EXP_SPLIT[21]="iid"; EXP_LATENT[21]=10; EXP_BETA[21]=1.0; EXP_LAMBDA[21]=50.0; EXP_BETASUP[21]=1.0; EXP_PURPOSE[21]="supervised-B-bruteforce-lambda"
+EXP_TRAINER[22]="supervised_vae"; EXP_SPLIT[22]="iid"; EXP_LATENT[22]=10; EXP_BETA[22]=1.0; EXP_LAMBDA[22]=1.0;  EXP_BETASUP[22]=0.0; EXP_PURPOSE[22]="supervised-C-perdim-beta"
+EXP_TRAINER[23]="supervised_vae"; EXP_SPLIT[23]="iid"; EXP_LATENT[23]=10; EXP_BETA[23]=1.0; EXP_LAMBDA[23]=10.0; EXP_BETASUP[23]=0.0; EXP_PURPOSE[23]="supervised-D-recommended"
+# Phase 2g: stronger β-VAE for clean axis-alignment (cells 30–31)
+EXP_TRAINER[30]="vae"; EXP_SPLIT[30]="iid"; EXP_LATENT[30]=10; EXP_BETA[30]=8.0;  EXP_PURPOSE[30]="beta-vae-strong";   EXP_SUFFIX[30]="e100"
+EXP_TRAINER[31]="vae"; EXP_SPLIT[31]="iid"; EXP_LATENT[31]=10; EXP_BETA[31]=16.0; EXP_PURPOSE[31]="beta-vae-stronger"; EXP_SUFFIX[31]="e100"
 
 run_name_for() {
     local exp_id=$1
     local base
     if [[ "${EXP_TRAINER[$exp_id]}" == "factor_vae" ]]; then
         base="factorvae_z${EXP_LATENT[$exp_id]}_gamma${EXP_GAMMA[$exp_id]}_seed${SEED}"
+    elif [[ "${EXP_TRAINER[$exp_id]}" == "supervised_vae" ]]; then
+        base="supervised_vae_z${EXP_LATENT[$exp_id]}_beta${EXP_BETA[$exp_id]}_lambda${EXP_LAMBDA[$exp_id]}_betasup${EXP_BETASUP[$exp_id]}_seed${SEED}"
     else
         base="vae_z${EXP_LATENT[$exp_id]}_beta${EXP_BETA[$exp_id]}_seed${SEED}"
     fi

@@ -71,6 +71,44 @@ EXPERIMENTS = [
     {"id": 13, "trainer": "factor_vae", "split": "iid", "latent_dim": 10, "gamma": 35.0,
      "purpose": "factor-vae-gsweep", "name_suffix": "e150",
      "notes": "FactorVAE γ=35, 150 epochs — recon/TC trade-off study (vs 50ep cell 5)"},
+    # ---- Phase 2f: targeted weak supervision (cells 20–23) ---------------
+    # 2x2 grid over (λ ∈ {1,10,50}) × (β_supervised ∈ {0,1}). Ids start at 20
+    # to leave room for future Phase 2d/2e cells.
+    #   sup-A (20): diagnostic — reproduce v1 failure (matches existing seed=0 ckpt).
+    #   sup-B (21): "just bump λ" — KL still on supervised dims.
+    #   sup-C (22): per-dim β alone — modest λ, no KL on supervised dims.
+    #   sup-D (23): recommended — both fixes together.
+    {"id": 20, "trainer": "supervised_vae", "split": "iid",
+     "latent_dim": 10, "beta": 1.0,
+     "lambda_scale": 1.0, "lambda_orient": 1.0, "beta_supervised": 1.0,
+     "purpose": "supervised-A-diagnostic",
+     "notes": "Supervised VAE, λ=1, β_sup=1 (diagnostic baseline; reproduces v1 failure)"},
+    {"id": 21, "trainer": "supervised_vae", "split": "iid",
+     "latent_dim": 10, "beta": 1.0,
+     "lambda_scale": 50.0, "lambda_orient": 50.0, "beta_supervised": 1.0,
+     "purpose": "supervised-B-bruteforce-lambda",
+     "notes": "Supervised VAE, λ=50, β_sup=1 (brute-force λ, KL still fights MSE)"},
+    {"id": 22, "trainer": "supervised_vae", "split": "iid",
+     "latent_dim": 10, "beta": 1.0,
+     "lambda_scale": 1.0, "lambda_orient": 1.0, "beta_supervised": 0.0,
+     "purpose": "supervised-C-perdim-beta",
+     "notes": "Supervised VAE, λ=1, β_sup=0 (per-dim β alone, modest λ)"},
+    {"id": 23, "trainer": "supervised_vae", "split": "iid",
+     "latent_dim": 10, "beta": 1.0,
+     "lambda_scale": 10.0, "lambda_orient": 10.0, "beta_supervised": 0.0,
+     "purpose": "supervised-D-recommended",
+     "notes": "Supervised VAE, λ=10, β_sup=0 (recommended; both fixes)"},
+    # ---- Phase 2g: stronger β-VAE for clean axis-alignment (cells 30–31) --
+    # β=4 (cell 2) sits at the bottom of the useful range for 64×64 binary
+    # dSprites — Higgins et al. recommend β∈{4,8,16,32,64}, with the cleanly
+    # axis-aligned regime usually starting at β≥8. e100 keeps these distinct
+    # from the 50-epoch β=4 cell so MIG/DCI can plateau before we evaluate.
+    {"id": 30, "trainer": "vae", "split": "iid", "latent_dim": 10, "beta": 8.0,
+     "purpose": "beta-vae-strong", "name_suffix": "e100",
+     "notes": "β-VAE β=8, 100 epochs — push for axis-alignment"},
+    {"id": 31, "trainer": "vae", "split": "iid", "latent_dim": 10, "beta": 16.0,
+     "purpose": "beta-vae-stronger", "name_suffix": "e100",
+     "notes": "β-VAE β=16, 100 epochs — strong KL pressure, expect dim collapse"},
 ]
 
 
@@ -78,21 +116,24 @@ EXPERIMENTS = [
 # in-process loader in main() will exec the chosen script's main() with the
 # argv we construct in build_train_argv().
 TRAINER_PATHS = {
-    "vae":        "scripts/train_vae.py",
-    "factor_vae": "scripts/train_factorvae.py",
+    "vae":            "scripts/train_vae.py",
+    "factor_vae":     "scripts/train_factorvae.py",
+    "supervised_vae": "scripts/train_supervised_vae.py",
 }
 
 # Default config per trainer (used when --config is not overridden by the
 # bash launcher).
 TRAINER_DEFAULT_CONFIG = {
-    "vae":        "configs/vae.yaml",
-    "factor_vae": "configs/factor_vae.yml",
+    "vae":            "configs/vae.yaml",
+    "factor_vae":     "configs/factor_vae.yml",
+    "supervised_vae": "configs/supervised_vae.yaml",
 }
 
 # Default checkpoint root per trainer.
 TRAINER_DEFAULT_OUT_DIR = {
-    "vae":        "checkpoints/vae",
-    "factor_vae": "checkpoints/factor_vae",
+    "vae":            "checkpoints/vae",
+    "factor_vae":     "checkpoints/factor_vae",
+    "supervised_vae": "checkpoints/vae",       # supervised runs share the vae root.
 }
 
 
@@ -106,19 +147,32 @@ def get_experiment(experiment_id: int) -> dict:
 def run_name(exp: dict, seed: int) -> str:
     """Run name format depends on the trainer family and split.
 
-    IID + VAE family   : vae_z{latent}_beta{beta}_seed{seed}        (unchanged)
-    IID + FactorVAE    : factorvae_z{latent}_gamma{gamma}_seed{seed} (unchanged)
-    Correlated + VAE   : correlated_vae_z{latent}_beta{beta}_seed{seed}
-    Correlated + FVAE  : correlated_factorvae_z{latent}_gamma{gamma}_seed{seed}
-    Heldout    + …     : heldout_…
+    IID + VAE family       : vae_z{latent}_beta{beta}_seed{seed}                            (unchanged)
+    IID + FactorVAE        : factorvae_z{latent}_gamma{gamma}_seed{seed}                    (unchanged)
+    IID + Supervised VAE   : supervised_vae_z{latent}_beta{beta}_lambda{λ}_betasup{βsup}_seed{seed}
+    Correlated + VAE       : correlated_vae_z{latent}_beta{beta}_seed{seed}
+    Correlated + FVAE      : correlated_factorvae_z{latent}_gamma{gamma}_seed{seed}
+    Heldout    + …         : heldout_…
 
-    The IID format is unprefixed so existing checkpoint paths (Exps 1–5)
-    remain valid without renaming.
+    The IID format for vae/factor_vae is unprefixed so existing checkpoint
+    paths (Exps 1–5) remain valid without renaming. Supervised runs encode
+    the sweep axes (λ, β_sup) into the directory name so the explorer's
+    `_seeds_by_exp` glob can discover seeds within a sweep cell.
     """
     trainer = exp.get("trainer", "vae")
     split   = exp.get("split", "iid")
     if trainer == "factor_vae":
         base = f"factorvae_z{exp['latent_dim']}_gamma{exp['gamma']}_seed{seed}"
+    elif trainer == "supervised_vae":
+        # λ_s and λ_o are independent in principle but identical in this sweep;
+        # collapse to a single λ token in the path for brevity, falling back to
+        # λ_s if they ever diverge.
+        lam_s = exp.get("lambda_scale",  1.0)
+        lam_o = exp.get("lambda_orient", lam_s)
+        lam_token = (f"{lam_s}" if lam_s == lam_o else f"{lam_s}-{lam_o}")
+        bsup = exp.get("beta_supervised", 0.0)
+        base = (f"supervised_vae_z{exp['latent_dim']}"
+                f"_beta{exp['beta']}_lambda{lam_token}_betasup{bsup}_seed{seed}")
     else:
         base = f"vae_z{exp['latent_dim']}_beta{exp['beta']}_seed{seed}"
     if exp.get("name_suffix"):
@@ -140,6 +194,13 @@ def build_tags(exp: dict, *, runtime: str, node: str) -> list[str]:
     ]
     if trainer == "factor_vae":
         base.insert(2, f"gamma{exp['gamma']}")
+    elif trainer == "supervised_vae":
+        base.insert(2, f"beta{exp['beta']}")
+        base += [
+            f"lambda_scale{exp.get('lambda_scale', 1.0)}",
+            f"lambda_orient{exp.get('lambda_orient', 1.0)}",
+            f"beta_supervised{exp.get('beta_supervised', 0.0)}",
+        ]
     else:
         base.insert(2, f"beta{exp['beta']}")
     return base
@@ -161,7 +222,10 @@ def build_train_argv(args: argparse.Namespace, exp: dict) -> list[str]:
     cfg     = args.config  if args.config  else TRAINER_DEFAULT_CONFIG[trainer]
     out_dir = args.out_dir if args.out_dir else TRAINER_DEFAULT_OUT_DIR[trainer]
 
-    script = "train_factorvae.py" if trainer == "factor_vae" else "train_vae.py"
+    script = {
+        "factor_vae":     "train_factorvae.py",
+        "supervised_vae": "train_supervised_vae.py",
+    }.get(trainer, "train_vae.py")
     argv = [
         script,
         "--config",         cfg,
@@ -178,9 +242,18 @@ def build_train_argv(args: argparse.Namespace, exp: dict) -> list[str]:
         "--wandb-notes",    exp["notes"],
         "--wandb-tags",     *tags,
     ]
-    # Trainer-specific hyperparameter flag.
+    # Trainer-specific hyperparameter flags.
     if trainer == "factor_vae":
         argv += ["--gamma", str(exp["gamma"])]
+    elif trainer == "supervised_vae":
+        argv += [
+            "--beta",            str(exp["beta"]),
+            "--lambda-scale",    str(exp.get("lambda_scale", 1.0)),
+            "--lambda-orient",   str(exp.get("lambda_orient", 1.0)),
+            "--beta-supervised", str(exp.get("beta_supervised", 0.0)),
+        ]
+        if "free_bits" in exp:
+            argv += ["--free-bits", str(exp["free_bits"])]
     else:
         argv += ["--beta", str(exp["beta"])]
 
@@ -247,7 +320,13 @@ def main() -> None:
         return
 
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
-    hp = (f"beta={exp['beta']}" if trainer == "vae" else f"gamma={exp['gamma']}")
+    if trainer == "factor_vae":
+        hp = f"gamma={exp['gamma']}"
+    elif trainer == "supervised_vae":
+        hp = (f"beta={exp['beta']} lambda={exp.get('lambda_scale', 1.0)}/"
+              f"{exp.get('lambda_orient', 1.0)} beta_sup={exp.get('beta_supervised', 0.0)}")
+    else:
+        hp = f"beta={exp['beta']}"
     split = exp.get("split", "iid")
     print(f"[sweep] experiment_id={exp['id']} trainer={trainer} split={split} "
           f"purpose={exp['purpose']} latent_dim={exp['latent_dim']} {hp} "

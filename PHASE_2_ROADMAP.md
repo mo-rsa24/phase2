@@ -639,6 +639,79 @@ the held-out cells.
 
 ---
 
+## Phase 2g — Hardening: axis-alignment seed sweep
+
+### Why this phase
+
+Every β-VAE / FactorVAE cell on disk is **single-seed**, which on
+dSprites is anecdote rather than signal (Locatello et al. 2019). On
+top of that, β=4 (Exp 2) sits at the bottom of the useful range for
+64×64 binary dSprites — Higgins et al. recommend β∈{4, 8, 16, 32, 64}
+and the cleanly-axis-aligned regime usually starts at β≥8.
+
+Goal: enough replicates and a strong-enough β to credibly claim
+*axis-aligned* disentanglement (slider test passes for posX/posY/scale
+across a majority of seeds), and a Compare-tab MIG/DCI mean±std
+instead of point estimates.
+
+### Code changes (already shipped)
+
+- New cells **Exp 30** (β=8, e100) and **Exp 31** (β=16, e100) in
+  [scripts/sweep_disentanglement.py](scripts/sweep_disentanglement.py),
+  with bash mirrors and a `hippo-betasweep` alias in
+  [scripts/launch_sweep.sh](scripts/launch_sweep.sh).
+- `hippo-replicate` alias re-runs Exps 2 (β=4) + 5 (γ=35) so missing
+  seeds can be filled with a single command.
+- Explorer presets now point at `final.pt` (end-of-training latent
+  geometry) rather than `best.pt` (lowest val ELBO ≠ most disentangled
+  for β-VAE). Legacy `best.pt` posts to `/api/load` transparently fall
+  back to a sibling `final.pt`.
+
+### Run the sweep
+
+All three tiers run unattended on hippo (single GPU, sequential).
+
+```bash
+# Tier 1 — replicate β=4 / γ=35 across seeds 0–3 (~2h on hippo)
+for s in 0 1 2 3; do
+  bash scripts/launch_sweep.sh --node hippo-replicate --seed "$s"
+done
+
+# Tier 2 — train β=8 and β=16 at 100 epochs across seeds 0–3, 42 (~4h)
+for s in 0 1 2 3 42; do
+  bash scripts/launch_sweep.sh --node hippo-betasweep --seed "$s" --epochs 100
+done
+
+# Tier 3 — finish Phase 2c γ-sweep at 150 epochs across seeds 0–3, 42 (~6h)
+for s in 0 1 2 3 42; do
+  bash scripts/launch_sweep.sh --node hippo-gamma --seed "$s"
+done
+```
+
+Smoke-test before launching the full sweep:
+
+```bash
+bash scripts/launch_sweep.sh --node hippo-betasweep --seed 0 --dry-run
+bash scripts/launch_sweep.sh --node hippo-betasweep --seed 0 --epochs 2  # ~3 min
+```
+
+### Acceptance criteria
+
+After Tier 1 + Tier 2 finish, open the **Compare** tab, pin Exp 2 /
+Exp 5 / Exp 30 / Exp 31 across all 5 seeds. Axis-alignment is
+"achieved" when, for β=8 or β=16:
+
+- ≥1 latent slider per ground-truth factor (excluding orientation)
+  shows single-factor response in latent traversals on a *majority* of
+  seeds, **and**
+- Mean across 5 seeds: **MIG ≥ 0.20** and **DCI-D ≥ 0.30**.
+
+If both fail at β=16, the next escalation is the supervised pathway
+(Phase 2f — already implemented in
+[scripts/train_supervised_vae.py](scripts/train_supervised_vae.py)).
+
+---
+
 ## Cross-cutting browser evolution
 
 These extensions are not phase-specific — they elevate the explorer

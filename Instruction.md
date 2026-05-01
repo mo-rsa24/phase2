@@ -668,6 +668,18 @@ Goal:
 - focus on representation partitioning intuition,
 - document what is prototype-level versus fully validated.
 
+### Stage 6: Targeted weak supervision (Phase 2f)
+
+Goal:
+
+- pin scale and orientation to specific latent dims via auxiliary MSE,
+- use per-dim β to remove KL/MSE conflict on supervised dims,
+- demonstrate axis-controllability suitable for downstream conditional diffusion.
+
+See [docs/targeted_supervision.md](docs/targeted_supervision.md) for theory,
+loss derivation, and run commands. The trainer is `scripts/train_supervised_vae.py`;
+the sweep is Exps 20–23 in `scripts/sweep_disentanglement.py`.
+
 This ordering matters because each stage builds the foundation for the next.
 
 ---

@@ -1,0 +1,47 @@
+# Targeted weak-supervision VAE configuration for dSprites.
+# Usage: python scripts/train_supervised_vae.py --config configs/supervised_vae.yaml
+#
+# Latent partition (enforced by `src/utils/factor_targets.py`):
+#   z[0]      = z_s    — supervised to normalised scale, MSE.
+#   z[1..2]   = z_o    — supervised to (sin(k·θ), cos(k·θ)), MSE.
+#   z[3..D-1] = z_free — unconstrained, KL-regularised.
+# See docs/targeted_supervision.md for the loss derivation.
+
+model:
+  latent_dim: 10
+  img_size: [1, 64, 64]
+
+training:
+  epochs: 50
+  batch_size: 128
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  beta: 1.0               # KL weight on FREE dims (β-VAE β).
+  seed: 0
+
+# Supervision-specific knobs. CLI flags (--lambda-scale, --lambda-orient,
+# --beta-supervised, --free-bits) override these at parse time.
+supervision:
+  lambda_scale:    5.0    # weight on MSE(μ_0, scale_target).
+  lambda_orient:   5.0    # weight on MSE(μ_1:3, (sin kθ, cos kθ)).
+  beta_supervised: 0.0    # KL weight on supervised dims; 0 = treat as labeled outputs.
+  free_bits:       0.0    # nats per free dim KL floor; 0 = disabled.
+
+data:
+  train_frac: 0.70
+  val_frac: 0.15
+
+logging:
+  wandb_project: paper2-supervised-vae
+  log_interval: 5         # epochs between recon-grid + PCA-manifold logging.
+  n_viz: 8
+  pca_samples: 5000
+
+# Selected by `--runtime <key>`. CLI flags override these.
+runtime:
+  hippo:                  # 1x RTX 5090 (32 GB)
+    batch_size: 1024
+    num_workers: 6
+  cluster48:              # mscluster106 / mscluster107 (2x 48 GB)
+    batch_size: 2048
+    num_workers: 8
