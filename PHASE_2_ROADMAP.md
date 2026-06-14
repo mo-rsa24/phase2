@@ -1,57 +1,81 @@
 # Phase 2 Roadmap — Beyond the IID Baseline
 
-> **Companion to** [PROJECT_GUIDE.md](PROJECT_GUIDE.md) (overall project context)
-> and [EXPLORER_GUIDE.md](EXPLORER_GUIDE.md) (current browser features).
+> **Archived companion docs** (dSprites phase complete):
+> [PROJECT_GUIDE.md](docs/archived-dsprites/PROJECT_GUIDE.md) ·
+> [EXPLORER_GUIDE.md](docs/archived-dsprites/EXPLORER_GUIDE.md)
 >
-> **Purpose:** lay out the four remaining phases of work, with explicit
-> code-change checklists per phase and the corresponding extensions the
-> browser app needs to surface the results.
+> **Status as of 2026-06-14:** dSprites work is complete or superseded.
+> Project has pivoted to a three-stage Gaussian/PoE/DDPM scope —
+> see [MASTER_PLAN.md](MASTER_PLAN.md) for the active roadmap.
 
 ---
 
-## Where we are
+## Where we are (verified 2026-06-14)
 
-✅ **Phase 2a (IID baseline)** — Exp 1–4 (β-VAE family) and Exp 5
-(FactorVAE) are trained on the IID split. The browser supports MIG,
-correlation heatmap, KL spectrum, single-dim traversal modal,
-factor-conditional histograms, 2D KL scatter with hover→original+recon.
+✅ **Phase 2a (IID baseline) — DONE**
+Exp 1–5 checkpoints all present. Multi-seed (seeds 0,1,2,3,42) for Exp 1 (β=1).
 
-✅ **Dataset infra** — [src/datasets/correlated_dsprites.py](src/datasets/correlated_dsprites.py)
-already implements `make_correlated_split` and `make_heldout_pair_split`;
-no changes needed there.
+- `checkpoints/vae/vae_z10_beta1.0_seed{0,1,2,3,42}/`
+- `checkpoints/vae/vae_z10_beta4.0_seed42/`
+- `checkpoints/vae/vae_z4_beta1.0_seed42/`
+- `checkpoints/vae/vae_z20_beta1.0_seed42/`
+- `checkpoints/factor_vae/factorvae_z10_gamma35.0_seed42/`
 
-🟡 **Empty stubs awaiting implementation:**
-| Path | Purpose | Phase |
+✅ **Phase 2c (DCI metric) — DONE**
+`src/metrics/dci.py` (188 lines, full RF implementation), `scripts/eval_dci.py`,
+`/api/dci/start` endpoint in the explorer. `compute_dci()` is reusable beyond dSprites.
+
+✅ **Phase 2f (Supervised VAE, Exp 20) — PARTIAL**
+`scripts/train_supervised_vae.py` + `docs/targeted_supervision.md` exist.
+Exp 20 (sup-A) checkpoint present: `checkpoints/vae/supervised_vae_z10_beta1.0_lambda1.0_betasup1.0_seed0/`.
+Exps 21–23 **not run** — dropped (superseded by new direction).
+
+✅ **Dataset infra — DONE**
+[src/datasets/correlated_dsprites.py](src/datasets/correlated_dsprites.py)
+implements `make_correlated_split` and `make_heldout_pair_split`.
+
+✅ **Stub files (still empty — retained as placeholders):**
+
+| Path | Purpose | Decision |
 |---|---|---|
-| [src/metrics/dci.py](src/metrics/dci.py) | DCI metric | 2c |
-| [src/metrics/recombination.py](src/metrics/recombination.py) | held-out recombination metrics | 2e |
-| [src/metrics/probes.py](src/metrics/probes.py) | swap-loss / GRL probes for SepVAE | 2d |
-| [src/models/sepvae.py](src/models/sepvae.py) | partitioned VAE | 2d |
-| [src/models/grl.py](src/models/grl.py) | gradient reversal layer | 2d |
-| [src/models/beta_vae.py](src/models/beta_vae.py) | (currently subsumed by `--beta` flag) | n/a |
-| [scripts/eval_dci.py](scripts/eval_dci.py) | offline DCI evaluation script | 2c |
+| [src/metrics/recombination.py](src/metrics/recombination.py) | held-out recombination | Superseded by Stage 3 |
+| [src/metrics/probes.py](src/metrics/probes.py) | GRL probes for SepVAE | Superseded |
+| [src/models/sepvae.py](src/models/sepvae.py) | partitioned VAE | Superseded |
+| [src/models/grl.py](src/models/grl.py) | gradient reversal layer | Superseded |
+| [src/models/beta_vae.py](src/models/beta_vae.py) | (subsumed by `--beta` flag) | n/a |
 
 ---
 
 ## At a glance
 
-| Phase | Adds | Browser surface |
-|---|---|---|
-| **2b — Correlated split** | 5 new sweep cells (Exp 6–10) using `make_correlated_split('scale','orientation')`; `--split` flag in trainers | Split-aware run cards, provenance bar, side-by-side compare mode |
-| **2c — DCI metric** | `compute_dci()` in `src/metrics/dci.py`; `/api/dci` endpoint | New "DCI" panel in Analysis tab (importance heatmap + per-factor D/C/I bars + click-to-traversal) |
-| **2d — SepVAE** | Design note → `grl.py` → `sepvae.py` → trainer → config → Exp 11 | Partitioned latent panel (μ bars colour-coded by group); group-aware 2D scatter; swap-decoded gallery |
-| **2e — Held-out split** | `--split heldout` flag; cells 12–16; `eval_recombination` metric | Held-out gallery (factor combos never seen at train); per-cell recon MSE bar |
+> ⚠️ **Project has pivoted (2026-06-14).** Phases 2b, 2d, 2e, 2g, and all
+> browser extensions below are superseded. The active roadmap is in
+> [MASTER_PLAN.md](MASTER_PLAN.md). This section is retained as a historical
+> record of what was planned and why.
 
-**Cross-cutting browser evolution** (covers all phases):
-- Multi-checkpoint **Compare tab**.
-- Cross-experiment **Summary table** (3 splits × 5 architectures × MIG / DCI / TC / heldout-MSE).
-- **Provenance bar** (split, hyperparameters, seed) on every loaded checkpoint.
+| Phase | Adds | Status |
+|---|---|---|
+| **2b — Correlated split** | Sweep cells 6–10; `--split correlated` wired | SUPERSEDED — training never ran; new direction replaces this RQ |
+| **2c — DCI metric** | `compute_dci()` in `src/metrics/dci.py` | ✅ DONE — reusable beyond dSprites |
+| **2d — SepVAE** | grl.py → sepvae.py → trainer → config | SUPERSEDED — all files still 0 bytes; PoE replaces this approach |
+| **2e — Held-out split** | `--split heldout` wired; recombination metric | SUPERSEDED — metric empty; Stage 3 generalises this |
+| **2f — Supervised VAE** | Exp 20 complete; Exps 21–23 not run | PARTIAL — Exps 21–23 dropped |
+| **2g — Hardening** | β=8/16 cells defined; multi-seed for Exp 1 done | SUPERSEDED — β sweep not relevant to new direction |
+
+**Cross-cutting browser extensions (all superseded):**
+
+- Multi-checkpoint Compare tab: endpoint wired, full UI not built.
+- Summary table, Provenance bar, Routing UX: not built.
 
 ---
 
-## Phase 2b — Correlated split: the central RQ test
+## ~~Phase 2b — Correlated split~~ SUPERSEDED
 
-### Why this phase
+> Training infrastructure wired (`--split correlated`, sweep cells 6–10 defined) but
+> experiments never ran. Superseded by Stage 1/2 Gaussian proof which tests the
+> same PoE failure mode analytically and numerically.
+
+### Why this phase (historical)
 
 The research question — *"do scale and orientation get encoded
 independently when training data correlates them?"* — only becomes
@@ -183,7 +207,7 @@ Implementation sketch:
 
 ---
 
-## Phase 2c — DCI: the second-opinion metric
+## Phase 2c — DCI: the second-opinion metric ✅ DONE
 
 ### Why this phase
 
@@ -319,7 +343,12 @@ KaTeX formula:
 
 ---
 
-## Phase 2d — SepVAE: design-then-build
+## ~~Phase 2d — SepVAE: design-then-build~~ SUPERSEDED
+
+> All implementation files still 0 bytes (`grl.py`, `sepvae.py`, `sepvae.yml`,
+> no trainer script). The GRL/partition approach is replaced by Product-of-Experts
+> composition in the new direction. Design logic archived in
+> [docs/archived-dsprites/sepvae_design_logic.md](docs/archived-dsprites/sepvae_design_logic.md).
 
 ### Why this phase
 
@@ -536,7 +565,11 @@ each linking the methodology to the visual.
 
 ---
 
-## Phase 2e — Held-out pair split: compositional generalisation
+## ~~Phase 2e — Held-out pair split~~ SUPERSEDED
+
+> Trainer flag (`--split heldout`) wired but sweep cells 12–16 were never
+> defined, `recombination.py` is empty, and the browser gallery was never built.
+> Compositional generalisation testing is carried forward in Stage 3 (3D Shapes).
 
 ### Why this phase
 
@@ -639,7 +672,11 @@ the held-out cells.
 
 ---
 
-## Phase 2g — Hardening: axis-alignment seed sweep
+## ~~Phase 2g — Hardening: axis-alignment seed sweep~~ SUPERSEDED
+
+> Exp 30 (β=8) and Exp 31 (β=16) defined but never trained. Multi-seed for
+> Exp 1 (β=1, seeds 0–3,42) is done. The β-escalation acceptance criterion
+> (MIG ≥ 0.20, DCI-D ≥ 0.30) is no longer the gating question for the project.
 
 ### Why this phase
 
