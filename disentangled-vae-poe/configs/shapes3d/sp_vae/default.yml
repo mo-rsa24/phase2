@@ -1,0 +1,15 @@
+z_c_dim: 8
+z_d_dim: 2
+beta_c_max: 1.0
+beta_d_max: 4.0
+dann_lambda_max: 1.0
+warmup_frac: 0.2
+orth_weight: 1.0
+mi_weight: 0.1
+ce_weight: 1.0
+grl_weight: 1.0
+vicreg_eps: 1.0
+lr: 1.0e-4
+batch_size: 64
+epochs: 100
+seed: 42
